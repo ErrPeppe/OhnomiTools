@@ -11,15 +11,16 @@ from .config import CANONICAL_CHROMOSOMES, PATHS, ProjectPaths
 
 logger = logging.getLogger("OhnomiTools.fetcher")
 
-# Archivi ufficiali Ensembl con BioMart attivo (in ordine di affidabilità/carico)
+# Archivi HTTPS ufficiali Ensembl con BioMart attivo
 BIOMART_ARCHIVE_URLS: tuple[str, ...] = (
     "https://e115.ensembl.org/biomart/martservice",
-    "https://sep2025.archive.ensembl.org/biomart/martservice",
     "https://jun2026.archive.ensembl.org/biomart/martservice",
+    "https://sep2025.archive.ensembl.org/biomart/martservice",
     "https://may2025.archive.ensembl.org/biomart/martservice",
 )
 
-BIOMART_PARALOGUES_XML = (
+# Query 1 (solo pagina `feature_page`): catalogo geni umani con coordinate, strand e biotype
+BIOMART_GENES_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
     '<!DOCTYPE Query>'
     '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1" count="" datasetConfigVersion="0.6">'
@@ -29,11 +30,20 @@ BIOMART_PARALOGUES_XML = (
     '<Attribute name="chromosome_name" />'
     '<Attribute name="start_position" />'
     '<Attribute name="end_position" />'
+    '<Attribute name="strand" />'
+    '<Attribute name="gene_biotype" />'
+    '</Dataset>'
+    '</Query>'
+)
+
+# Query 2 (solo pagina `homologs`): coppie di paraloghi umani con clade ancestrale e % identità
+BIOMART_PARALOGUES_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<!DOCTYPE Query>'
+    '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1" count="" datasetConfigVersion="0.6">'
+    '<Dataset name="hsapiens_gene_ensembl" interface="default">'
+    '<Attribute name="ensembl_gene_id" />'
     '<Attribute name="hsapiens_paralog_ensembl_gene" />'
-    '<Attribute name="hsapiens_paralog_associated_gene_name" />'
-    '<Attribute name="hsapiens_paralog_chromosome" />'
-    '<Attribute name="hsapiens_paralog_chrom_start" />'
-    '<Attribute name="hsapiens_paralog_chrom_end" />'
     '<Attribute name="hsapiens_paralog_subtype" />'
     '<Attribute name="hsapiens_paralog_orthology_type" />'
     '<Attribute name="hsapiens_paralog_perc_id" />'
@@ -45,8 +55,8 @@ BIOMART_PARALOGUES_XML = (
 
 class DataIngestionPipeline:
     """
-    Pipeline ETL (Bronze -> Silver Parquet) per LncBook v2.0, OHNOLOGS v2 ed Ensembl BioMart.
-    Ottimizzata per l'esecuzione su Google Colab con storage su Google Drive.
+    Pipeline ETL (Bronze -> Silver Parquet) per LncBook v2.0, OHNOLOGS ed Ensembl BioMart.
+    Ottimizzata per Google Colab con storage persistente su Google Drive.
     """
 
     def __init__(self, paths: ProjectPaths = PATHS) -> None:
@@ -54,8 +64,8 @@ class DataIngestionPipeline:
 
     def _decompress_to_scratch(self, gz_path: Path) -> Path:
         """
-        Decomprime un file .gz da Google Drive direttamente sull'SSD locale (/tmp)
-        di Colab per evitare picchi di RAM durante il parsing CSV/GTF in Polars.
+        Decomprime un file .gz da Google Drive sull'SSD locale (/tmp) di Colab
+        per evitare picchi di RAM durante il parsing CSV/GTF in Polars.
         """
         if not gz_path.exists():
             raise FileNotFoundError(f"File Bronze mancante su Google Drive: {gz_path}")
@@ -64,16 +74,15 @@ class DataIngestionPipeline:
             return gz_path
 
         scratch_target = self.paths.scratch / gz_path.stem
-        logger.info(f"Decompressione su SSD locale (/tmp): {gz_path.name} -> {scratch_target.name}")
+        logger.info(f"Decompressione su /tmp: {gz_path.name} -> {scratch_target.name}")
         with gzip.open(gz_path, "rb") as f_in, open(scratch_target, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
         return scratch_target
 
     def _download_biomart_tsv(self, xml_query: str, dest_path: Path) -> Path:
         """
-        Scarica una tabella TSV da Ensembl BioMart provando in sequenza gli archivi
-        HTTPS ufficiali (usando GET per evitare errori 405 sui redirect) e verifica
-        che il server abbia restituito dati TSV validi invece di una pagina HTML.
+        Scarica un TSV da Ensembl BioMart provando in sequenza gli archivi HTTPS
+        ufficiali (usando GET) e verificando che la risposta sia un TSV valido.
         """
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_download = self.paths.scratch / dest_path.name
@@ -81,7 +90,7 @@ class DataIngestionPipeline:
         errors: list[str] = []
 
         for url in BIOMART_ARCHIVE_URLS:
-            logger.info(f"Tentativo download Ensembl BioMart da: {url}")
+            logger.info(f"Download Ensembl BioMart ({dest_path.name}) da: {url}")
             try:
                 with requests.get(
                     url,
@@ -99,7 +108,7 @@ class DataIngestionPipeline:
 
                     head_text = first_chunk[:512].decode("utf-8", errors="ignore").lstrip()
                     if head_text.startswith("<") or "Query ERROR" in head_text:
-                        preview = head_text.splitlines()[0][:160]
+                        preview = head_text.splitlines()[0][:200]
                         raise ValueError(f"Risposta non-TSV dal server BioMart: {preview}")
 
                     with open(tmp_download, "wb") as f:
@@ -109,7 +118,7 @@ class DataIngestionPipeline:
                                 f.write(chunk)
 
                 shutil.move(str(tmp_download), str(dest_path))
-                logger.info(f"Download BioMart completato con successo da {url}")
+                logger.info(f"Download completato: {dest_path.name}")
                 return dest_path
 
             except Exception as exc:
@@ -119,14 +128,14 @@ class DataIngestionPipeline:
                 errors.append(f"{url} -> {exc}")
 
         raise RuntimeError(
-            "Impossibile scaricare i paraloghi da tutti gli archivi Ensembl BioMart:\n"
+            f"Impossibile scaricare {dest_path.name} dagli archivi Ensembl BioMart:\n"
             + "\n".join(errors)
         )
 
     def build_lncbook_master_tables(self, force_rebuild: bool = False) -> tuple[Path, Path]:
         """
-        Estrae dal GTF puro di LncBook v2.0 sia il catalogo dei trascritti sia
-        quello aggregato a livello di gene (coordinate canoniche chr1..22, X, Y).
+        Estrae dal GTF puro di LncBook v2.0 il catalogo dei trascritti e quello
+        aggregato a livello di gene su cromosomi canonici (chr1..22, chrX, chrY).
         """
         out_tx = self.paths.silver_lncrna_transcripts
         out_genes = self.paths.silver_lncrna_genes
@@ -195,8 +204,8 @@ class DataIngestionPipeline:
         force_rebuild: bool = False,
     ) -> Path:
         """
-        Converte in streaming un CSV/TSV compresso di LncBook (Conservazione, miRNA, RBP)
-        in formato Apache Parquet compresso (zstd) su Google Drive.
+        Converte in streaming un CSV/TSV compresso di LncBook (Conservazione, miRNA,
+        RBP, Espressione) in formato Apache Parquet compresso (zstd) su Google Drive.
         """
         if silver_parquet_path.exists() and not force_rebuild:
             logger.info(f"Parquet già presente in Silver: {silver_parquet_path.name}. Skip.")
@@ -221,40 +230,207 @@ class DataIngestionPipeline:
             if tmp_csv != raw_gz_path and tmp_csv.exists():
                 tmp_csv.unlink()
 
+    def fetch_and_build_ensembl_pc_genes(self, force_rebuild: bool = False) -> Path:
+        """
+        Scarica da Ensembl BioMart il catalogo dei geni umani e filtra i geni
+        `protein_coding` sui cromosomi canonici con coordinate e strand (+/-).
+        """
+        raw_tsv = self.paths.raw_ensembl_genes
+        out_pc = self.paths.silver_ensembl_pc_genes
+
+        if out_pc.exists() and not force_rebuild:
+            logger.info("Catalogo Ensembl protein-coding già presente in Silver. Skip.")
+            return out_pc
+
+        if not raw_tsv.exists() or force_rebuild:
+            self._download_biomart_tsv(BIOMART_GENES_XML, raw_tsv)
+
+        df_raw = pl.read_csv(
+            raw_tsv,
+            separator="\t",
+            schema_overrides={
+                "Chromosome/scaffold name": pl.Utf8,
+                "Gene start (bp)": pl.Int64,
+                "Gene end (bp)": pl.Int64,
+                "Strand": pl.Int8,
+            },
+            ignore_errors=True,
+        )
+
+        col_map = {
+            "Gene stable ID": "gene_id",
+            "Gene name": "gene_name",
+            "Chromosome/scaffold name": "scaffold_id",
+            "Gene start (bp)": "start",
+            "Gene end (bp)": "end",
+            "Strand": "strand_num",
+            "Gene type": "gene_biotype",
+        }
+        df_pc = (
+            df_raw.rename({k: v for k, v in col_map.items() if k in df_raw.columns})
+            .filter(pl.col("gene_biotype") == "protein_coding")
+            .with_columns([
+                pl.concat_str([pl.lit("chr"), pl.col("scaffold_id")]).alias("chr"),
+                pl.when(pl.col("strand_num") == 1)
+                .then(pl.lit("+"))
+                .when(pl.col("strand_num") == -1)
+                .then(pl.lit("-"))
+                .otherwise(pl.lit(None))
+                .alias("strand"),
+            ])
+            .filter(pl.col("chr").is_in(CANONICAL_CHROMOSOMES))
+            .select(["gene_id", "gene_name", "chr", "start", "end", "strand", "gene_biotype"])
+            .unique(subset=["gene_id"])
+            .sort(["chr", "start"])
+        )
+
+        self.paths.save_parquet_safe(df_pc, out_pc)
+        return out_pc
+
     def build_ohnologs_wgd_tables(self, force_rebuild: bool = False) -> tuple[Path, Path]:
         """
-        Normalizza i file TSV di OHNOLOGS v2 (geni e coppie WGD) in formato Parquet.
+        Normalizza i file TSV senza intestazione del dump OHNOLOGS:
+        - `database/genes.tsv` (10 colonne, filtrato su `homo_sapiens`)
+        - `ohnologs/homo_sapiens.tsv` (4.650 ohnologhi umani + categoria 1r/2r/both/unk/syn/htf)
+        - `database/gene_ohnology.tsv` (filtrato su coppie intra-umane ENSP-ENSP -> ENSG-ENSG)
         """
         out_genes = self.paths.silver_wgd_genes
         out_pairs = self.paths.silver_wgd_pairs
 
         if out_genes.exists() and out_pairs.exists() and not force_rebuild:
-            logger.info("Tabelle OHNOLOGS v2 (WGD) già presenti in Silver. Skip.")
+            logger.info("Tabelle OHNOLOGS (WGD) già presenti in Silver. Skip.")
             return out_genes, out_pairs
 
-        if self.paths.raw_ohnologs_genes.exists():
-            df_genes = pl.read_csv(
+        # 1. Leggi database/genes.tsv filtrando solo homo_sapiens su cromosomi canonici
+        genes_cols = [
+            "species_id", "scaffold_id", "segment_id", "family_id",
+            "gene_id", "protein_id", "start", "end", "pvc", "pgc"
+        ]
+        df_human_all = (
+            pl.scan_csv(
                 self.paths.raw_ohnologs_genes,
                 separator="\t",
-                ignore_errors=True,
+                has_header=False,
+                new_columns=genes_cols,
+                schema_overrides={
+                    "species_id": pl.Utf8,
+                    "scaffold_id": pl.Utf8,
+                    "segment_id": pl.Utf8,
+                    "family_id": pl.Utf8,
+                    "gene_id": pl.Utf8,
+                    "protein_id": pl.Utf8,
+                    "start": pl.Int64,
+                    "end": pl.Int64,
+                    "pvc": pl.Utf8,
+                    "pgc": pl.Utf8,
+                },
             )
-            self.paths.save_parquet_safe(df_genes, out_genes)
+            .filter(pl.col("species_id") == "homo_sapiens")
+            .with_columns(
+                pl.concat_str([pl.lit("chr"), pl.col("scaffold_id")]).alias("chr")
+            )
+            .filter(pl.col("chr").is_in(CANONICAL_CHROMOSOMES))
+            .select([
+                "gene_id", "protein_id", "chr", "start", "end",
+                "family_id", "segment_id", "pvc", "pgc"
+            ])
+            .collect()
+        )
 
+        # Arricchisci con gene_name e strand (+/-) da Ensembl protein-coding se disponibile
+        if self.paths.silver_ensembl_pc_genes.exists():
+            df_pc = pl.read_parquet(self.paths.silver_ensembl_pc_genes).select(
+                ["gene_id", "gene_name", "strand"]
+            )
+            df_human_all = df_human_all.join(df_pc, on="gene_id", how="left")
+        else:
+            df_human_all = df_human_all.with_columns([
+                pl.lit(None, dtype=pl.Utf8).alias("gene_name"),
+                pl.lit(None, dtype=pl.Utf8).alias("strand"),
+            ])
+
+        # 2. Leggi ohnologs/homo_sapiens.tsv (lista ohnologhi umani + categoria)
+        df_hs_ohno = pl.read_csv(
+            self.paths.raw_ohnologs_human_list,
+            separator="\t",
+            has_header=False,
+            new_columns=["protein_id", "retention_category"],
+            schema_overrides={"protein_id": pl.Utf8, "retention_category": pl.Utf8},
+        )
+
+        df_wgd_genes = (
+            df_human_all.join(df_hs_ohno, on="protein_id", how="inner")
+            .unique(subset=["gene_id"])
+            .sort(["chr", "start"])
+        )
+        self.paths.save_parquet_safe(df_wgd_genes, out_genes)
+
+        # 3. Costruisci le coppie WGD intra-umane da database/gene_ohnology.tsv
         if self.paths.raw_ohnologs_pairs.exists():
-            df_pairs = pl.read_csv(
+            prot_map = df_human_all.join(df_hs_ohno, on="protein_id", how="left").select([
+                "protein_id", "gene_id", "gene_name", "chr", "start", "end",
+                "strand", "family_id", "retention_category"
+            ]).unique(subset=["protein_id"])
+
+            lf_raw_pairs = pl.scan_csv(
                 self.paths.raw_ohnologs_pairs,
                 separator="\t",
-                ignore_errors=True,
+                has_header=False,
+                new_columns=["protein_id_1", "protein_id_2", "wgd_round"],
+                schema_overrides={
+                    "protein_id_1": pl.Utf8,
+                    "protein_id_2": pl.Utf8,
+                    "wgd_round": pl.Utf8,
+                },
             )
-            self.paths.save_parquet_safe(df_pairs, out_pairs)
+
+            lf_p1 = prot_map.lazy().rename({
+                "protein_id": "protein_id_1",
+                "gene_id": "gene_id_1",
+                "gene_name": "gene_name_1",
+                "chr": "chr_1",
+                "start": "start_1",
+                "end": "end_1",
+                "strand": "strand_1",
+                "family_id": "family_id_1",
+                "retention_category": "retention_category_1",
+            })
+            lf_p2 = prot_map.lazy().rename({
+                "protein_id": "protein_id_2",
+                "gene_id": "gene_id_2",
+                "gene_name": "gene_name_2",
+                "chr": "chr_2",
+                "start": "start_2",
+                "end": "end_2",
+                "strand": "strand_2",
+                "family_id": "family_id_2",
+                "retention_category": "retention_category_2",
+            })
+
+            df_wgd_pairs = (
+                lf_raw_pairs
+                .join(lf_p1, on="protein_id_1", how="inner")
+                .join(lf_p2, on="protein_id_2", how="inner")
+                .filter(pl.col("gene_id_1") != pl.col("gene_id_2"))
+                .with_columns(
+                    pl.when(pl.col("gene_id_1") < pl.col("gene_id_2"))
+                    .then(pl.concat_str([pl.col("gene_id_1"), pl.lit("_"), pl.col("gene_id_2")]))
+                    .otherwise(pl.concat_str([pl.col("gene_id_2"), pl.lit("_"), pl.col("gene_id_1")]))
+                    .alias("pair_key")
+                )
+                .unique(subset=["pair_key"])
+                .sort(["chr_1", "start_1"])
+                .collect()
+            )
+            self.paths.save_parquet_safe(df_wgd_pairs, out_pairs)
 
         return out_genes, out_pairs
 
     def fetch_and_build_ensembl_ssd_pairs(self, force_rebuild: bool = False) -> Path:
         """
-        Scarica i paraloghi umani da Ensembl BioMart (se non già presenti in Bronze)
-        e costruisce in Silver il dataset di controllo SSD (Small Scale Duplications),
-        escludendo le coppie classificate come WGD in OHNOLOGS v2.
+        Scarica i paraloghi umani da Ensembl BioMart (solo pagina `homologs`),
+        li arricchisce con coordinate e strand dei geni `protein_coding` e sottrae
+        tutte le coppie WGD di OHNOLOGS per ottenere il controllo SSD puro.
         """
         raw_tsv = self.paths.raw_ensembl_paralogues
         out_ssd = self.paths.silver_ssd_pairs
@@ -263,61 +439,55 @@ class DataIngestionPipeline:
             logger.info("Tabella Ensembl SSD già presente in Silver. Skip.")
             return out_ssd
 
+        if not self.paths.silver_ensembl_pc_genes.exists():
+            self.fetch_and_build_ensembl_pc_genes(force_rebuild=False)
+
         if not raw_tsv.exists() or force_rebuild:
             self._download_biomart_tsv(BIOMART_PARALOGUES_XML, raw_tsv)
 
         df_raw = pl.read_csv(raw_tsv, separator="\t", ignore_errors=True)
         col_map = {
             "Gene stable ID": "gene_id_1",
-            "Gene name": "gene_name_1",
-            "Chromosome/scaffold name": "chr_1",
-            "Gene start (bp)": "start_1",
-            "Gene end (bp)": "end_1",
             "Human paralogue gene stable ID": "gene_id_2",
-            "Human paralogue associated gene name": "gene_name_2",
-            "Human paralogue chromosome/scaffold name": "chr_2",
-            "Human paralogue chromosome/scaffold start (bp)": "start_2",
-            "Human paralogue chromosome/scaffold end (bp)": "end_2",
             "Human paralogue last common ancestor with Human": "ancestor_clade",
             "Human paralogue homology type": "homology_type",
             "Paralogue %id. target Human gene identical to query gene": "perc_id_1",
             "Paralogue %id. query gene identical to target Human gene": "perc_id_2",
         }
-        existing_map = {k: v for k, v in col_map.items() if k in df_raw.columns}
-        df_par = df_raw.rename(existing_map)
+        df_par = df_raw.rename({k: v for k, v in col_map.items() if k in df_raw.columns})
 
-        # Filtra righe valide e ordina la coppia (A, B) in modo canonico (pair_key)
+        df_pc = pl.read_parquet(self.paths.silver_ensembl_pc_genes).select([
+            "gene_id", "gene_name", "chr", "start", "end", "strand"
+        ])
+        pc1 = df_pc.rename({c: f"{c}_1" for c in df_pc.columns})
+        pc2 = df_pc.rename({c: f"{c}_2" for c in df_pc.columns})
+
         df_par = (
             df_par.filter(
                 pl.col("gene_id_1").is_not_null()
                 & pl.col("gene_id_2").is_not_null()
                 & (pl.col("gene_id_1") != pl.col("gene_id_2"))
             )
-            .with_columns([
+            .join(pc1, on="gene_id_1", how="inner")
+            .join(pc2, on="gene_id_2", how="inner")
+            .with_columns(
                 pl.when(pl.col("gene_id_1") < pl.col("gene_id_2"))
                 .then(pl.concat_str([pl.col("gene_id_1"), pl.lit("_"), pl.col("gene_id_2")]))
                 .otherwise(pl.concat_str([pl.col("gene_id_2"), pl.lit("_"), pl.col("gene_id_1")]))
                 .alias("pair_key")
-            ])
+            )
             .unique(subset=["pair_key"])
         )
 
-        # Sottrae le coppie WGD di OHNOLOGS v2 se già normalizzate con ID ENSG
+        # Sottrazione esatta delle coppie WGD (anti-join su pair_key canonica)
         if self.paths.silver_wgd_pairs.exists():
-            df_wgd = pl.read_parquet(self.paths.silver_wgd_pairs)
-            id_cols = [c for c in df_wgd.columns if "ensg" in c.lower() or "gene_id" in c.lower()]
-            if len(id_cols) >= 2:
-                c1, c2 = id_cols[0], id_cols[1]
-                wgd_keys = (
-                    df_wgd.select([
-                        pl.when(pl.col(c1) < pl.col(c2))
-                        .then(pl.concat_str([pl.col(c1), pl.lit("_"), pl.col(c2)]))
-                        .otherwise(pl.concat_str([pl.col(c2), pl.lit("_"), pl.col(c1)]))
-                        .alias("pair_key")
-                    ])
-                    .unique()
-                )
-                df_par = df_par.join(wgd_keys, on="pair_key", how="anti")
+            wgd_keys = pl.read_parquet(self.paths.silver_wgd_pairs).select(["pair_key"]).unique()
+            n_before = len(df_par)
+            df_par = df_par.join(wgd_keys, on="pair_key", how="anti")
+            logger.info(
+                f"Anti-join WGD -> SSD: {n_before:,} paraloghi Ensembl -> "
+                f"{len(df_par):,} coppie SSD pure (rimosse {n_before - len(df_par):,} coppie WGD)."
+            )
 
         self.paths.save_parquet_safe(df_par, out_ssd)
         return out_ssd
@@ -357,10 +527,27 @@ class DataIngestionPipeline:
                 force_rebuild=force_rebuild,
             )
 
-        if self.paths.raw_ohnologs_pairs.exists() or self.paths.raw_ohnologs_genes.exists():
+        if self.paths.raw_lncbook_expr.exists():
+            outputs["expression"] = self.convert_csv_dataset_to_silver(
+                self.paths.raw_lncbook_expr,
+                self.paths.silver_lncbook_expr,
+                separator=",",
+                force_rebuild=force_rebuild,
+            )
+
+        # Prima i geni protein-coding Ensembl (forniscono gene_name e strand a WGD e SSD)
+        outputs["ensembl_pc_genes"] = self.fetch_and_build_ensembl_pc_genes(
+            force_rebuild=force_rebuild
+        )
+
+        # Poi le tabelle WGD (forniscono pair_key per l'anti-join sugli SSD)
+        if self.paths.raw_ohnologs_human_list.exists() and self.paths.raw_ohnologs_genes.exists():
             wgd_g, wgd_p = self.build_ohnologs_wgd_tables(force_rebuild=force_rebuild)
             outputs["wgd_genes"] = wgd_g
             outputs["wgd_pairs"] = wgd_p
 
-        outputs["ssd_pairs"] = self.fetch_and_build_ensembl_ssd_pairs(force_rebuild=force_rebuild)
+        # Infine le coppie SSD pure da Ensembl BioMart
+        outputs["ssd_pairs"] = self.fetch_and_build_ensembl_ssd_pairs(
+            force_rebuild=force_rebuild
+        )
         return outputs
