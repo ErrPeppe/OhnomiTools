@@ -29,5 +29,5 @@ dependencies = [
 Repository = "https://github.com/ErrPeppe/OhnomiTools"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["OhnomiTools*"]
+where = ["src"]
+include = ["ohnomitools*"]
