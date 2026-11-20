@@ -14,17 +14,21 @@ logger = logging.getLogger("OhnomiTools.fetcher")
 # Archivi HTTPS ufficiali Ensembl con BioMart attivo
 BIOMART_ARCHIVE_URLS: tuple[str, ...] = (
     "https://e115.ensembl.org/biomart/martservice",
-    "https://jun2026.archive.ensembl.org/biomart/martservice",
     "https://sep2025.archive.ensembl.org/biomart/martservice",
+    "https://jun2026.archive.ensembl.org/biomart/martservice",
     "https://may2025.archive.ensembl.org/biomart/martservice",
 )
 
-# Query 1 (solo pagina `feature_page`): catalogo geni umani con coordinate, strand e biotype
+BIOMART_CANONICAL_CHRS = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,X,Y"
+
+# Query 1 (pagina `feature_page`): geni umani protein_coding con coordinate e strand
 BIOMART_GENES_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
     '<!DOCTYPE Query>'
     '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1" count="" datasetConfigVersion="0.6">'
     '<Dataset name="hsapiens_gene_ensembl" interface="default">'
+    '<Filter name="biotype" value="protein_coding" />'
+    f'<Filter name="chromosome_name" value="{BIOMART_CANONICAL_CHRS}" />'
     '<Attribute name="ensembl_gene_id" />'
     '<Attribute name="external_gene_name" />'
     '<Attribute name="chromosome_name" />'
@@ -36,12 +40,14 @@ BIOMART_GENES_XML = (
     '</Query>'
 )
 
-# Query 2 (solo pagina `homologs`): coppie di paraloghi umani con clade ancestrale e % identità
+# Query 2 (pagina `homologs`): soli paraloghi protein_coding su cromosomi canonici
 BIOMART_PARALOGUES_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
     '<!DOCTYPE Query>'
     '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1" count="" datasetConfigVersion="0.6">'
     '<Dataset name="hsapiens_gene_ensembl" interface="default">'
+    '<Filter name="biotype" value="protein_coding" />'
+    f'<Filter name="chromosome_name" value="{BIOMART_CANONICAL_CHRS}" />'
     '<Attribute name="ensembl_gene_id" />'
     '<Attribute name="hsapiens_paralog_ensembl_gene" />'
     '<Attribute name="hsapiens_paralog_subtype" />'
@@ -97,7 +103,7 @@ class DataIngestionPipeline:
                     params={"query": xml_query},
                     headers=headers,
                     stream=True,
-                    timeout=300,
+                    timeout=(15, 120),
                 ) as r:
                     r.raise_for_status()
                     chunk_iter = r.iter_content(chunk_size=1024 * 1024)
@@ -111,14 +117,20 @@ class DataIngestionPipeline:
                         preview = head_text.splitlines()[0][:200]
                         raise ValueError(f"Risposta non-TSV dal server BioMart: {preview}")
 
+                    bytes_written = 0
                     with open(tmp_download, "wb") as f:
                         f.write(first_chunk)
+                        bytes_written += len(first_chunk)
                         for chunk in chunk_iter:
                             if chunk:
                                 f.write(chunk)
+                                bytes_written += len(chunk)
 
                 shutil.move(str(tmp_download), str(dest_path))
-                logger.info(f"Download completato: {dest_path.name}")
+                logger.info(
+                    f"Download completato: {dest_path.name} "
+                    f"({bytes_written / (1024 * 1024):.2f} MB)"
+                )
                 return dest_path
 
             except Exception as exc:
@@ -291,7 +303,7 @@ class DataIngestionPipeline:
         """
         Normalizza i file TSV senza intestazione del dump OHNOLOGS:
         - `database/genes.tsv` (10 colonne, filtrato su `homo_sapiens`)
-        - `ohnologs/homo_sapiens.tsv` (4.650 ohnologhi umani + categoria 1r/2r/both/unk/syn/htf)
+        - `ohnologs/homo_sapiens.tsv` (4.650 ohnologhi umani + categoria)
         - `database/gene_ohnology.tsv` (filtrato su coppie intra-umane ENSP-ENSP -> ENSG-ENSG)
         """
         out_genes = self.paths.silver_wgd_genes
@@ -301,7 +313,6 @@ class DataIngestionPipeline:
             logger.info("Tabelle OHNOLOGS (WGD) già presenti in Silver. Skip.")
             return out_genes, out_pairs
 
-        # 1. Leggi database/genes.tsv filtrando solo homo_sapiens su cromosomi canonici
         genes_cols = [
             "species_id", "scaffold_id", "segment_id", "family_id",
             "gene_id", "protein_id", "start", "end", "pvc", "pgc"
@@ -312,6 +323,7 @@ class DataIngestionPipeline:
                 separator="\t",
                 has_header=False,
                 new_columns=genes_cols,
+                low_memory=True,
                 schema_overrides={
                     "species_id": pl.Utf8,
                     "scaffold_id": pl.Utf8,
@@ -337,7 +349,6 @@ class DataIngestionPipeline:
             .collect()
         )
 
-        # Arricchisci con gene_name e strand (+/-) da Ensembl protein-coding se disponibile
         if self.paths.silver_ensembl_pc_genes.exists():
             df_pc = pl.read_parquet(self.paths.silver_ensembl_pc_genes).select(
                 ["gene_id", "gene_name", "strand"]
@@ -349,7 +360,6 @@ class DataIngestionPipeline:
                 pl.lit(None, dtype=pl.Utf8).alias("strand"),
             ])
 
-        # 2. Leggi ohnologs/homo_sapiens.tsv (lista ohnologhi umani + categoria)
         df_hs_ohno = pl.read_csv(
             self.paths.raw_ohnologs_human_list,
             separator="\t",
@@ -365,7 +375,6 @@ class DataIngestionPipeline:
         )
         self.paths.save_parquet_safe(df_wgd_genes, out_genes)
 
-        # 3. Costruisci le coppie WGD intra-umane da database/gene_ohnology.tsv
         if self.paths.raw_ohnologs_pairs.exists():
             prot_map = df_human_all.join(df_hs_ohno, on="protein_id", how="left").select([
                 "protein_id", "gene_id", "gene_name", "chr", "start", "end",
@@ -376,6 +385,7 @@ class DataIngestionPipeline:
                 self.paths.raw_ohnologs_pairs,
                 separator="\t",
                 has_header=False,
+                low_memory=True,
                 new_columns=["protein_id_1", "protein_id_2", "wgd_round"],
                 schema_overrides={
                     "protein_id_1": pl.Utf8,
@@ -428,8 +438,8 @@ class DataIngestionPipeline:
 
     def fetch_and_build_ensembl_ssd_pairs(self, force_rebuild: bool = False) -> Path:
         """
-        Scarica i paraloghi umani da Ensembl BioMart (solo pagina `homologs`),
-        li arricchisce con coordinate e strand dei geni `protein_coding` e sottrae
+        Scarica i paraloghi umani protein-coding da Ensembl BioMart in modalità
+        a basso consumo di RAM, li arricchisce con coordinate e strand e sottrae
         tutte le coppie WGD di OHNOLOGS per ottenere il controllo SSD puro.
         """
         raw_tsv = self.paths.raw_ensembl_paralogues
@@ -445,7 +455,6 @@ class DataIngestionPipeline:
         if not raw_tsv.exists() or force_rebuild:
             self._download_biomart_tsv(BIOMART_PARALOGUES_XML, raw_tsv)
 
-        df_raw = pl.read_csv(raw_tsv, separator="\t", ignore_errors=True)
         col_map = {
             "Gene stable ID": "gene_id_1",
             "Human paralogue gene stable ID": "gene_id_2",
@@ -454,22 +463,36 @@ class DataIngestionPipeline:
             "Paralogue %id. target Human gene identical to query gene": "perc_id_1",
             "Paralogue %id. query gene identical to target Human gene": "perc_id_2",
         }
-        df_par = df_raw.rename({k: v for k, v in col_map.items() if k in df_raw.columns})
 
-        df_pc = pl.read_parquet(self.paths.silver_ensembl_pc_genes).select([
+        lf_raw = pl.scan_csv(
+            raw_tsv,
+            separator="\t",
+            low_memory=True,
+            infer_schema_length=10000,
+            ignore_errors=True,
+            schema_overrides={
+                "Gene stable ID": pl.Utf8,
+                "Human paralogue gene stable ID": pl.Utf8,
+            },
+        )
+        existing_cols = lf_raw.collect_schema().names()
+        rename_dict = {k: v for k, v in col_map.items() if k in existing_cols}
+
+        lf_pc = pl.scan_parquet(self.paths.silver_ensembl_pc_genes).select([
             "gene_id", "gene_name", "chr", "start", "end", "strand"
         ])
-        pc1 = df_pc.rename({c: f"{c}_1" for c in df_pc.columns})
-        pc2 = df_pc.rename({c: f"{c}_2" for c in df_pc.columns})
+        pc1 = lf_pc.rename({c: f"{c}_1" for c in ["gene_id", "gene_name", "chr", "start", "end", "strand"]})
+        pc2 = lf_pc.rename({c: f"{c}_2" for c in ["gene_id", "gene_name", "chr", "start", "end", "strand"]})
 
         df_par = (
-            df_par.filter(
+            lf_raw.rename(rename_dict)
+            .filter(
                 pl.col("gene_id_1").is_not_null()
                 & pl.col("gene_id_2").is_not_null()
+                & (pl.col("gene_id_1") != "")
+                & (pl.col("gene_id_2") != "")
                 & (pl.col("gene_id_1") != pl.col("gene_id_2"))
             )
-            .join(pc1, on="gene_id_1", how="inner")
-            .join(pc2, on="gene_id_2", how="inner")
             .with_columns(
                 pl.when(pl.col("gene_id_1") < pl.col("gene_id_2"))
                 .then(pl.concat_str([pl.col("gene_id_1"), pl.lit("_"), pl.col("gene_id_2")]))
@@ -477,6 +500,9 @@ class DataIngestionPipeline:
                 .alias("pair_key")
             )
             .unique(subset=["pair_key"])
+            .join(pc1, on="gene_id_1", how="inner")
+            .join(pc2, on="gene_id_2", how="inner")
+            .collect()
         )
 
         # Sottrazione esatta delle coppie WGD (anti-join su pair_key canonica)
@@ -535,18 +561,15 @@ class DataIngestionPipeline:
                 force_rebuild=force_rebuild,
             )
 
-        # Prima i geni protein-coding Ensembl (forniscono gene_name e strand a WGD e SSD)
         outputs["ensembl_pc_genes"] = self.fetch_and_build_ensembl_pc_genes(
             force_rebuild=force_rebuild
         )
 
-        # Poi le tabelle WGD (forniscono pair_key per l'anti-join sugli SSD)
         if self.paths.raw_ohnologs_human_list.exists() and self.paths.raw_ohnologs_genes.exists():
             wgd_g, wgd_p = self.build_ohnologs_wgd_tables(force_rebuild=force_rebuild)
             outputs["wgd_genes"] = wgd_g
             outputs["wgd_pairs"] = wgd_p
 
-        # Infine le coppie SSD pure da Ensembl BioMart
         outputs["ssd_pairs"] = self.fetch_and_build_ensembl_ssd_pairs(
             force_rebuild=force_rebuild
         )
