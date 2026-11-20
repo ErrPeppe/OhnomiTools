@@ -11,7 +11,6 @@ from .config import CANONICAL_CHROMOSOMES, PATHS, ProjectPaths
 
 logger = logging.getLogger("OhnomiTools.fetcher")
 
-# Archivi HTTPS ufficiali Ensembl con BioMart attivo
 BIOMART_ARCHIVE_URLS: tuple[str, ...] = (
     "https://e115.ensembl.org/biomart/martservice",
     "https://sep2025.archive.ensembl.org/biomart/martservice",
@@ -19,9 +18,15 @@ BIOMART_ARCHIVE_URLS: tuple[str, ...] = (
     "https://may2025.archive.ensembl.org/biomart/martservice",
 )
 
+STRING_INFO_URL = (
+    "https://stringdb-downloads.org/download/protein.info.v12.0/9606.protein.info.v12.0.txt.gz"
+)
+STRING_LINKS_URL = (
+    "https://stringdb-downloads.org/download/protein.links.v12.0/9606.protein.links.v12.0.txt.gz"
+)
+
 BIOMART_CANONICAL_CHRS = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,X,Y"
 
-# Query 1 (pagina `feature_page`): geni umani protein_coding con coordinate e strand
 BIOMART_GENES_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
     '<!DOCTYPE Query>'
@@ -40,7 +45,6 @@ BIOMART_GENES_XML = (
     '</Query>'
 )
 
-# Query 2 (pagina `homologs`): soli paraloghi protein_coding su cromosomi canonici
 BIOMART_PARALOGUES_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>'
     '<!DOCTYPE Query>'
@@ -61,35 +65,41 @@ BIOMART_PARALOGUES_XML = (
 
 class DataIngestionPipeline:
     """
-    Pipeline ETL (Bronze -> Silver Parquet) per LncBook v2.0, OHNOLOGS ed Ensembl BioMart.
-    Ottimizzata per Google Colab con storage persistente su Google Drive.
+    Pipeline ETL (Bronze -> Silver Parquet) per LncBook v2.0, OHNOLOGS, Ensembl BioMart e STRING v12.0.
     """
 
     def __init__(self, paths: ProjectPaths = PATHS) -> None:
         self.paths = paths
 
     def _decompress_to_scratch(self, gz_path: Path) -> Path:
-        """
-        Decomprime un file .gz da Google Drive sull'SSD locale (/tmp) di Colab
-        per evitare picchi di RAM durante il parsing CSV/GTF in Polars.
-        """
         if not gz_path.exists():
             raise FileNotFoundError(f"File Bronze mancante su Google Drive: {gz_path}")
-
         if gz_path.suffix != ".gz":
             return gz_path
-
         scratch_target = self.paths.scratch / gz_path.stem
         logger.info(f"Decompressione su /tmp: {gz_path.name} -> {scratch_target.name}")
         with gzip.open(gz_path, "rb") as f_in, open(scratch_target, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
         return scratch_target
 
+    def _download_file(self, url: str, dest_path: Path) -> Path:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.paths.scratch / dest_path.name
+        headers = {"User-Agent": "OhnomiTools/0.1.0 (https://github.com/ErrPeppe/OhnomiTools)"}
+        logger.info(f"Download {dest_path.name} da {url}...")
+        with requests.get(url, headers=headers, stream=True, timeout=(20, 300)) as r:
+            r.raise_for_status()
+            written = 0
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        written += len(chunk)
+        shutil.move(str(tmp_path), str(dest_path))
+        logger.info(f"Download completato: {dest_path.name} ({written / (1024 * 1024):.2f} MB)")
+        return dest_path
+
     def _download_biomart_tsv(self, xml_query: str, dest_path: Path) -> Path:
-        """
-        Scarica un TSV da Ensembl BioMart provando in sequenza gli archivi HTTPS
-        ufficiali (usando GET) e verificando che la risposta sia un TSV valido.
-        """
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_download = self.paths.scratch / dest_path.name
         headers = {"User-Agent": "OhnomiTools/0.1.0 (https://github.com/ErrPeppe/OhnomiTools)"}
@@ -145,10 +155,6 @@ class DataIngestionPipeline:
         )
 
     def build_lncbook_master_tables(self, force_rebuild: bool = False) -> tuple[Path, Path]:
-        """
-        Estrae dal GTF puro di LncBook v2.0 il catalogo dei trascritti e quello
-        aggregato a livello di gene su cromosomi canonici (chr1..22, chrX, chrY).
-        """
         out_tx = self.paths.silver_lncrna_transcripts
         out_genes = self.paths.silver_lncrna_genes
 
@@ -157,7 +163,6 @@ class DataIngestionPipeline:
             return out_tx, out_genes
 
         tmp_gtf = self._decompress_to_scratch(self.paths.raw_lncbook_gtf)
-
         try:
             gtf_cols = [
                 "chr", "source", "feature", "start", "end",
@@ -215,17 +220,12 @@ class DataIngestionPipeline:
         separator: str = ",",
         force_rebuild: bool = False,
     ) -> Path:
-        """
-        Converte in streaming un CSV/TSV compresso di LncBook (Conservazione, miRNA,
-        RBP, Espressione) in formato Apache Parquet compresso (zstd) su Google Drive.
-        """
         if silver_parquet_path.exists() and not force_rebuild:
             logger.info(f"Parquet già presente in Silver: {silver_parquet_path.name}. Skip.")
             return silver_parquet_path
 
         tmp_csv = self._decompress_to_scratch(raw_gz_path)
         tmp_parquet = self.paths.scratch / silver_parquet_path.name
-
         try:
             lf = pl.scan_csv(
                 tmp_csv,
@@ -243,10 +243,6 @@ class DataIngestionPipeline:
                 tmp_csv.unlink()
 
     def fetch_and_build_ensembl_pc_genes(self, force_rebuild: bool = False) -> Path:
-        """
-        Scarica da Ensembl BioMart il catalogo dei geni umani e filtra i geni
-        `protein_coding` sui cromosomi canonici con coordinate e strand (+/-).
-        """
         raw_tsv = self.paths.raw_ensembl_genes
         out_pc = self.paths.silver_ensembl_pc_genes
 
@@ -300,12 +296,6 @@ class DataIngestionPipeline:
         return out_pc
 
     def build_ohnologs_wgd_tables(self, force_rebuild: bool = False) -> tuple[Path, Path]:
-        """
-        Normalizza i file TSV senza intestazione del dump OHNOLOGS:
-        - `database/genes.tsv` (10 colonne, filtrato su `homo_sapiens`)
-        - `ohnologs/homo_sapiens.tsv` (4.650 ohnologhi umani + categoria)
-        - `database/gene_ohnology.tsv` (filtrato su coppie intra-umane ENSP-ENSP -> ENSG-ENSG)
-        """
         out_genes = self.paths.silver_wgd_genes
         out_pairs = self.paths.silver_wgd_pairs
 
@@ -338,9 +328,7 @@ class DataIngestionPipeline:
                 },
             )
             .filter(pl.col("species_id") == "homo_sapiens")
-            .with_columns(
-                pl.concat_str([pl.lit("chr"), pl.col("scaffold_id")]).alias("chr")
-            )
+            .with_columns(pl.concat_str([pl.lit("chr"), pl.col("scaffold_id")]).alias("chr"))
             .filter(pl.col("chr").is_in(CANONICAL_CHROMOSOMES))
             .select([
                 "gene_id", "protein_id", "chr", "start", "end",
@@ -437,11 +425,6 @@ class DataIngestionPipeline:
         return out_genes, out_pairs
 
     def fetch_and_build_ensembl_ssd_pairs(self, force_rebuild: bool = False) -> Path:
-        """
-        Scarica i paraloghi umani protein-coding da Ensembl BioMart in modalità
-        a basso consumo di RAM, li arricchisce con coordinate e strand e sottrae
-        tutte le coppie WGD di OHNOLOGS per ottenere il controllo SSD puro.
-        """
         raw_tsv = self.paths.raw_ensembl_paralogues
         out_ssd = self.paths.silver_ssd_pairs
 
@@ -505,7 +488,6 @@ class DataIngestionPipeline:
             .collect()
         )
 
-        # Sottrazione esatta delle coppie WGD (anti-join su pair_key canonica)
         if self.paths.silver_wgd_pairs.exists():
             wgd_keys = pl.read_parquet(self.paths.silver_wgd_pairs).select(["pair_key"]).unique()
             n_before = len(df_par)
@@ -518,10 +500,92 @@ class DataIngestionPipeline:
         self.paths.save_parquet_safe(df_par, out_ssd)
         return out_ssd
 
-    def run_all(self, force_rebuild: bool = False) -> dict[str, Path]:
+    def fetch_and_build_string_ppi(
+        self,
+        min_score: int = 700,
+        force_rebuild: bool = False,
+    ) -> Path:
         """
-        Esegue l'intera pipeline ETL sui file Bronze disponibili in Google Drive.
+        Scarica automaticamente STRING v12.0 umano (protein.info + protein.links),
+        filtra le interazioni ad alta confidenza (`combined_score >= min_score`) e
+        mappa gli ID `9606.ENSP...` sui simboli genici ufficiali (`preferred_name`).
         """
+        out_ppi = self.paths.silver_string_ppi
+        if out_ppi.exists() and not force_rebuild:
+            logger.info("Rete STRING PPI già presente in Silver. Skip.")
+            return out_ppi
+
+        info_gz = self.paths.raw_string_info
+        links_gz = self.paths.raw_string_links
+
+        if not info_gz.exists() or force_rebuild:
+            self._download_file(STRING_INFO_URL, info_gz)
+        if not links_gz.exists() or force_rebuild:
+            self._download_file(STRING_LINKS_URL, links_gz)
+
+        tmp_info = self._decompress_to_scratch(info_gz)
+        tmp_links = self._decompress_to_scratch(links_gz)
+
+        try:
+            df_info = (
+                pl.read_csv(
+                    tmp_info,
+                    separator="\t",
+                    columns=[0, 1],
+                    new_columns=["string_id", "preferred_name"],
+                    schema_overrides={"string_id": pl.Utf8, "preferred_name": pl.Utf8},
+                )
+                .drop_nulls()
+                .unique(subset=["string_id"])
+            )
+
+            lf_links = (
+                pl.scan_csv(
+                    tmp_links,
+                    separator=" ",
+                    low_memory=True,
+                    schema_overrides={
+                        "protein1": pl.Utf8,
+                        "protein2": pl.Utf8,
+                        "combined_score": pl.Int32,
+                    },
+                )
+                .filter(pl.col("combined_score") >= min_score)
+            )
+
+            lf_i1 = df_info.lazy().rename({"string_id": "protein1", "preferred_name": "gene_1"})
+            lf_i2 = df_info.lazy().rename({"string_id": "protein2", "preferred_name": "gene_2"})
+
+            df_ppi = (
+                lf_links
+                .join(lf_i1, on="protein1", how="inner")
+                .join(lf_i2, on="protein2", how="inner")
+                .filter(pl.col("gene_1") != pl.col("gene_2"))
+                .with_columns(
+                    pl.when(pl.col("gene_1") < pl.col("gene_2"))
+                    .then(pl.concat_str([pl.col("gene_1"), pl.lit("_"), pl.col("gene_2")]))
+                    .otherwise(pl.concat_str([pl.col("gene_2"), pl.lit("_"), pl.col("gene_1")]))
+                    .alias("pair_key")
+                )
+                .group_by("pair_key")
+                .agg([
+                    pl.min_horizontal("gene_1", "gene_2").first().alias("protein_1"),
+                    pl.max_horizontal("gene_1", "gene_2").first().alias("protein_2"),
+                    pl.col("combined_score").max().alias("combined_score"),
+                ])
+                .sort("combined_score", descending=True)
+                .collect()
+            )
+
+            self.paths.save_parquet_safe(df_ppi, out_ppi)
+            return out_ppi
+        finally:
+            if tmp_info.exists():
+                tmp_info.unlink()
+            if tmp_links.exists():
+                tmp_links.unlink()
+
+    def run_all(self, include_string: bool = True, force_rebuild: bool = False) -> dict[str, Path]:
         outputs: dict[str, Path] = {}
 
         if self.paths.raw_lncbook_gtf.exists():
@@ -529,37 +593,19 @@ class DataIngestionPipeline:
             outputs["transcripts"] = tx
             outputs["genes"] = gn
 
-        if self.paths.raw_lncbook_cons.exists():
-            outputs["conservation"] = self.convert_csv_dataset_to_silver(
-                self.paths.raw_lncbook_cons,
-                self.paths.silver_lncbook_cons,
-                separator=",",
-                force_rebuild=force_rebuild,
-            )
-
-        if self.paths.raw_lncbook_mirna_int.exists():
-            outputs["mirna_interactions"] = self.convert_csv_dataset_to_silver(
-                self.paths.raw_lncbook_mirna_int,
-                self.paths.silver_lncbook_mirna_int,
-                separator=",",
-                force_rebuild=force_rebuild,
-            )
-
-        if self.paths.raw_lncbook_rbp_int.exists():
-            outputs["rbp_interactions"] = self.convert_csv_dataset_to_silver(
-                self.paths.raw_lncbook_rbp_int,
-                self.paths.silver_lncbook_rbp_int,
-                separator=",",
-                force_rebuild=force_rebuild,
-            )
-
-        if self.paths.raw_lncbook_expr.exists():
-            outputs["expression"] = self.convert_csv_dataset_to_silver(
-                self.paths.raw_lncbook_expr,
-                self.paths.silver_lncbook_expr,
-                separator=",",
-                force_rebuild=force_rebuild,
-            )
+        csv_jobs = [
+            ("conservation", self.paths.raw_lncbook_cons, self.paths.silver_lncbook_cons),
+            ("mirna_interactions", self.paths.raw_lncbook_mirna_int, self.paths.silver_lncbook_mirna_int),
+            ("rbp_interactions", self.paths.raw_lncbook_rbp_int, self.paths.silver_lncbook_rbp_int),
+            ("expression", self.paths.raw_lncbook_expr, self.paths.silver_lncbook_expr),
+            ("sprotein", self.paths.raw_lncbook_sprotein, self.paths.silver_lncbook_sprotein),
+            ("methylation", self.paths.raw_lncbook_methylation, self.paths.silver_lncbook_methylation),
+        ]
+        for key, raw_p, silver_p in csv_jobs:
+            if raw_p.exists():
+                outputs[key] = self.convert_csv_dataset_to_silver(
+                    raw_p, silver_p, separator=",", force_rebuild=force_rebuild
+                )
 
         outputs["ensembl_pc_genes"] = self.fetch_and_build_ensembl_pc_genes(
             force_rebuild=force_rebuild
@@ -573,4 +619,10 @@ class DataIngestionPipeline:
         outputs["ssd_pairs"] = self.fetch_and_build_ensembl_ssd_pairs(
             force_rebuild=force_rebuild
         )
+
+        if include_string:
+            outputs["string_ppi"] = self.fetch_and_build_string_ppi(
+                min_score=700, force_rebuild=force_rebuild
+            )
+
         return outputs
