@@ -62,6 +62,20 @@ BIOMART_PARALOGUES_XML = (
     '</Query>'
 )
 
+LNCBOOK_MIRNA_COLUMNS: list[str] = [
+    "gene_id",
+    "symbol",
+    "unused_col3",
+    "transcript_id",
+    "start",
+    "end",
+    "mfe",
+    "tools",
+    "unused_col9",
+    "interaction_id",
+    "mirna_id",
+]
+
 
 class DataIngestionPipeline:
     """
@@ -218,6 +232,8 @@ class DataIngestionPipeline:
         raw_gz_path: Path,
         silver_parquet_path: Path,
         separator: str = ",",
+        has_header: bool = True,
+        new_columns: list[str] | None = None,
         force_rebuild: bool = False,
     ) -> Path:
         if silver_parquet_path.exists() and not force_rebuild:
@@ -227,12 +243,16 @@ class DataIngestionPipeline:
         tmp_csv = self._decompress_to_scratch(raw_gz_path)
         tmp_parquet = self.paths.scratch / silver_parquet_path.name
         try:
-            lf = pl.scan_csv(
-                tmp_csv,
-                separator=separator,
-                infer_schema_length=10000,
-                ignore_errors=True,
-            )
+            scan_kwargs: dict = {
+                "separator": separator,
+                "has_header": has_header,
+                "infer_schema_length": 10000,
+                "ignore_errors": True,
+            }
+            if new_columns is not None:
+                scan_kwargs["new_columns"] = new_columns
+
+            lf = pl.scan_csv(tmp_csv, **scan_kwargs)
             lf.sink_parquet(tmp_parquet, compression="zstd")
             silver_parquet_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(tmp_parquet), str(silver_parquet_path))
@@ -241,6 +261,20 @@ class DataIngestionPipeline:
         finally:
             if tmp_csv != raw_gz_path and tmp_csv.exists():
                 tmp_csv.unlink()
+
+    def build_lncbook_mirna_interactions(self, force_rebuild: bool = False) -> Path:
+        """
+        Converte `lncrna_mirna_miRandaAndTargetScanAndRNAhybrid_LncBook2.0.csv.gz`
+        (che è privo di intestazione) assegnando esplicitamente i nomi delle 11 colonne.
+        """
+        return self.convert_csv_dataset_to_silver(
+            self.paths.raw_lncbook_mirna_int,
+            self.paths.silver_lncbook_mirna_int,
+            separator=",",
+            has_header=False,
+            new_columns=LNCBOOK_MIRNA_COLUMNS,
+            force_rebuild=force_rebuild,
+        )
 
     def fetch_and_build_ensembl_pc_genes(self, force_rebuild: bool = False) -> Path:
         raw_tsv = self.paths.raw_ensembl_genes
@@ -505,11 +539,6 @@ class DataIngestionPipeline:
         min_score: int = 700,
         force_rebuild: bool = False,
     ) -> Path:
-        """
-        Scarica automaticamente STRING v12.0 umano (protein.info + protein.links),
-        filtra le interazioni ad alta confidenza (`combined_score >= min_score`) e
-        mappa gli ID `9606.ENSP...` sui simboli genici ufficiali (`preferred_name`).
-        """
         out_ppi = self.paths.silver_string_ppi
         if out_ppi.exists() and not force_rebuild:
             logger.info("Rete STRING PPI già presente in Silver. Skip.")
@@ -593,9 +622,13 @@ class DataIngestionPipeline:
             outputs["transcripts"] = tx
             outputs["genes"] = gn
 
+        if self.paths.raw_lncbook_mirna_int.exists():
+            outputs["mirna_interactions"] = self.build_lncbook_mirna_interactions(
+                force_rebuild=force_rebuild
+            )
+
         csv_jobs = [
             ("conservation", self.paths.raw_lncbook_cons, self.paths.silver_lncbook_cons),
-            ("mirna_interactions", self.paths.raw_lncbook_mirna_int, self.paths.silver_lncbook_mirna_int),
             ("rbp_interactions", self.paths.raw_lncbook_rbp_int, self.paths.silver_lncbook_rbp_int),
             ("expression", self.paths.raw_lncbook_expr, self.paths.silver_lncbook_expr),
             ("sprotein", self.paths.raw_lncbook_sprotein, self.paths.silver_lncbook_sprotein),
