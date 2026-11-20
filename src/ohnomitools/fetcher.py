@@ -11,29 +11,36 @@ from .config import CANONICAL_CHROMOSOMES, PATHS, ProjectPaths
 
 logger = logging.getLogger("OhnomiTools.fetcher")
 
-BIOMART_URL = "http://www.ensembl.org/biomart/martservice"
+# Archivi ufficiali Ensembl con BioMart attivo (in ordine di affidabilità/carico)
+BIOMART_ARCHIVE_URLS: tuple[str, ...] = (
+    "https://e115.ensembl.org/biomart/martservice",
+    "https://sep2025.archive.ensembl.org/biomart/martservice",
+    "https://jun2026.archive.ensembl.org/biomart/martservice",
+    "https://may2025.archive.ensembl.org/biomart/martservice",
+)
 
-BIOMART_PARALOGUES_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE Query>
-<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1" count="" datasetConfigVersion="0.6">
-    <Dataset name="hsapiens_gene_ensembl" interface="default">
-        <Attribute name="ensembl_gene_id" />
-        <Attribute name="external_gene_name" />
-        <Attribute name="chromosome_name" />
-        <Attribute name="start_position" />
-        <Attribute name="end_position" />
-        <Attribute name="hsapiens_paralog_ensembl_gene" />
-        <Attribute name="hsapiens_paralog_associated_gene_name" />
-        <Attribute name="hsapiens_paralog_chromosome" />
-        <Attribute name="hsapiens_paralog_chrom_start" />
-        <Attribute name="hsapiens_paralog_chrom_end" />
-        <Attribute name="hsapiens_paralog_subtype" />
-        <Attribute name="hsapiens_paralog_orthology_type" />
-        <Attribute name="hsapiens_paralog_perc_id" />
-        <Attribute name="hsapiens_paralog_perc_id_r1" />
-    </Dataset>
-</Query>
-"""
+BIOMART_PARALOGUES_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<!DOCTYPE Query>'
+    '<Query virtualSchemaName="default" formatter="TSV" header="1" uniqueRows="1" count="" datasetConfigVersion="0.6">'
+    '<Dataset name="hsapiens_gene_ensembl" interface="default">'
+    '<Attribute name="ensembl_gene_id" />'
+    '<Attribute name="external_gene_name" />'
+    '<Attribute name="chromosome_name" />'
+    '<Attribute name="start_position" />'
+    '<Attribute name="end_position" />'
+    '<Attribute name="hsapiens_paralog_ensembl_gene" />'
+    '<Attribute name="hsapiens_paralog_associated_gene_name" />'
+    '<Attribute name="hsapiens_paralog_chromosome" />'
+    '<Attribute name="hsapiens_paralog_chrom_start" />'
+    '<Attribute name="hsapiens_paralog_chrom_end" />'
+    '<Attribute name="hsapiens_paralog_subtype" />'
+    '<Attribute name="hsapiens_paralog_orthology_type" />'
+    '<Attribute name="hsapiens_paralog_perc_id" />'
+    '<Attribute name="hsapiens_paralog_perc_id_r1" />'
+    '</Dataset>'
+    '</Query>'
+)
 
 
 class DataIngestionPipeline:
@@ -61,6 +68,60 @@ class DataIngestionPipeline:
         with gzip.open(gz_path, "rb") as f_in, open(scratch_target, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)
         return scratch_target
+
+    def _download_biomart_tsv(self, xml_query: str, dest_path: Path) -> Path:
+        """
+        Scarica una tabella TSV da Ensembl BioMart provando in sequenza gli archivi
+        HTTPS ufficiali (usando GET per evitare errori 405 sui redirect) e verifica
+        che il server abbia restituito dati TSV validi invece di una pagina HTML.
+        """
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_download = self.paths.scratch / dest_path.name
+        headers = {"User-Agent": "OhnomiTools/0.1.0 (https://github.com/ErrPeppe/OhnomiTools)"}
+        errors: list[str] = []
+
+        for url in BIOMART_ARCHIVE_URLS:
+            logger.info(f"Tentativo download Ensembl BioMart da: {url}")
+            try:
+                with requests.get(
+                    url,
+                    params={"query": xml_query},
+                    headers=headers,
+                    stream=True,
+                    timeout=300,
+                ) as r:
+                    r.raise_for_status()
+                    chunk_iter = r.iter_content(chunk_size=1024 * 1024)
+                    first_chunk = next(chunk_iter, b"")
+
+                    if not first_chunk:
+                        raise ValueError("Risposta vuota dal server BioMart.")
+
+                    head_text = first_chunk[:512].decode("utf-8", errors="ignore").lstrip()
+                    if head_text.startswith("<") or "Query ERROR" in head_text:
+                        preview = head_text.splitlines()[0][:160]
+                        raise ValueError(f"Risposta non-TSV dal server BioMart: {preview}")
+
+                    with open(tmp_download, "wb") as f:
+                        f.write(first_chunk)
+                        for chunk in chunk_iter:
+                            if chunk:
+                                f.write(chunk)
+
+                shutil.move(str(tmp_download), str(dest_path))
+                logger.info(f"Download BioMart completato con successo da {url}")
+                return dest_path
+
+            except Exception as exc:
+                if tmp_download.exists():
+                    tmp_download.unlink()
+                logger.warning(f"Archivio BioMart fallito ({url}): {exc}")
+                errors.append(f"{url} -> {exc}")
+
+        raise RuntimeError(
+            "Impossibile scaricare i paraloghi da tutti gli archivi Ensembl BioMart:\n"
+            + "\n".join(errors)
+        )
 
     def build_lncbook_master_tables(self, force_rebuild: bool = False) -> tuple[Path, Path]:
         """
@@ -151,7 +212,6 @@ class DataIngestionPipeline:
                 infer_schema_length=10000,
                 ignore_errors=True,
             )
-            # sink_parquet lavora out-of-core senza saturare la RAM di Colab
             lf.sink_parquet(tmp_parquet, compression="zstd")
             silver_parquet_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(tmp_parquet), str(silver_parquet_path))
@@ -194,7 +254,7 @@ class DataIngestionPipeline:
         """
         Scarica i paraloghi umani da Ensembl BioMart (se non già presenti in Bronze)
         e costruisce in Silver il dataset di controllo SSD (Small Scale Duplications),
-        escludendo tutte le coppie classificate come WGD in OHNOLOGS v2.
+        escludendo le coppie classificate come WGD in OHNOLOGS v2.
         """
         raw_tsv = self.paths.raw_ensembl_paralogues
         out_ssd = self.paths.silver_ssd_pairs
@@ -204,22 +264,7 @@ class DataIngestionPipeline:
             return out_ssd
 
         if not raw_tsv.exists() or force_rebuild:
-            logger.info("Download paraloghi umani da Ensembl BioMart in corso...")
-            raw_tsv.parent.mkdir(parents=True, exist_ok=True)
-            tmp_download = self.paths.scratch / raw_tsv.name
-            with requests.post(
-                BIOMART_URL,
-                data={"query": BIOMART_PARALOGUES_XML},
-                stream=True,
-                timeout=300,
-            ) as r:
-                r.raise_for_status()
-                with open(tmp_download, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-            shutil.move(str(tmp_download), str(raw_tsv))
-            logger.info(f"Download BioMart completato: {raw_tsv.name}")
+            self._download_biomart_tsv(BIOMART_PARALOGUES_XML, raw_tsv)
 
         df_raw = pl.read_csv(raw_tsv, separator="\t", ignore_errors=True)
         col_map = {
@@ -233,7 +278,7 @@ class DataIngestionPipeline:
             "Human paralogue chromosome/scaffold name": "chr_2",
             "Human paralogue chromosome/scaffold start (bp)": "start_2",
             "Human paralogue chromosome/scaffold end (bp)": "end_2",
-            "Human paralogueancestor": "ancestor_clade",
+            "Human paralogue last common ancestor with Human": "ancestor_clade",
             "Human paralogue homology type": "homology_type",
             "Paralogue %id. target Human gene identical to query gene": "perc_id_1",
             "Paralogue %id. query gene identical to target Human gene": "perc_id_2",
@@ -257,10 +302,10 @@ class DataIngestionPipeline:
             .unique(subset=["pair_key"])
         )
 
-        # Sottrae le coppie WGD di OHNOLOGS v2 per ottenere un controllo SSD puro
+        # Sottrae le coppie WGD di OHNOLOGS v2 se già normalizzate con ID ENSG
         if self.paths.silver_wgd_pairs.exists():
             df_wgd = pl.read_parquet(self.paths.silver_wgd_pairs)
-            id_cols = [c for c in df_wgd.columns if "ensg" in c.lower() or "id" in c.lower()]
+            id_cols = [c for c in df_wgd.columns if "ensg" in c.lower() or "gene_id" in c.lower()]
             if len(id_cols) >= 2:
                 c1, c2 = id_cols[0], id_cols[1]
                 wgd_keys = (
