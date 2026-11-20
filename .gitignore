@@ -1,0 +1,36 @@
+# Byte-compiled / Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging & distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter & Colab checkpoints
+.ipynb_checkpoints/
+
+# Local data lake & heavy bioinformatics artifacts (kept on Google Drive)
+data/
+*.parquet
+*.gtf
+*.gtf.gz
+*.fa
+*.fa.gz
+*.tsv
+*.csv
+*.csv.gz
+*.txt.gz
+
+# OS & editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
