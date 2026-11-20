@@ -1,5 +1,0 @@
-# OhnomiTools/__init__.py
-from OhnomiTools.config import CANONICAL_CHROMOSOMES, PATHS, ProjectPaths, setup_colab
-
-__version__ = "0.1.0"
-__all__ = ["CANONICAL_CHROMOSOMES", "PATHS", "ProjectPaths", "setup_colab", "__version__"]
