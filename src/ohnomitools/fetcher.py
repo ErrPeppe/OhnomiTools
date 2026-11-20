@@ -7,7 +7,7 @@ import shutil
 import requests
 import polars as pl
 
-from OhnomiTools.config import CANONICAL_CHROMOSOMES, PATHS, ProjectPaths
+from .config import CANONICAL_CHROMOSOMES, PATHS, ProjectPaths
 
 logger = logging.getLogger("OhnomiTools.fetcher")
 
