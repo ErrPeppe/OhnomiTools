@@ -55,7 +55,6 @@ def _mount_via_rclone_secret(
     """
     Monta silenziosamente la sola cartella dati su Google Drive tramite rclone
     usando il secret Colab `RCLONE_CONF` (zero popup e zero email di sicurezza).
-    Restituisce il Path montato oppure None se il secret non è configurato.
     """
     try:
         from google.colab import userdata  # type: ignore
@@ -70,7 +69,6 @@ def _mount_via_rclone_secret(
         logger.info(f"Cartella Drive già montata via rclone in {mount_dir}")
         return mount_dir
 
-    # Installa rclone e fuse3 se non presenti sul runtime Colab
     if shutil.which("rclone") is None or (
         shutil.which("fusermount3") is None and shutil.which("fusermount") is None
     ):
@@ -78,7 +76,6 @@ def _mount_via_rclone_secret(
         subprocess.run(["apt-get", "update", "-qq"], check=True)
         subprocess.run(["apt-get", "install", "-y", "-qq", "rclone", "fuse3"], check=True)
 
-    # Scrive temporaneamente rclone.conf con permessi ristretti (solo proprietario)
     conf_path = Path("/root/.config/rclone/rclone.conf")
     conf_path.parent.mkdir(parents=True, exist_ok=True)
     conf_path.write_text(rclone_conf.strip() + "\n", encoding="utf-8")
@@ -87,7 +84,6 @@ def _mount_via_rclone_secret(
     subpath_str = Path(drive_subpath).as_posix().strip("/")
     remote_target = f"{remote_name}:{subpath_str}"
 
-    # Garantisce che la cartella di destinazione esista su Drive prima del mount
     mkdir_proc = subprocess.run(
         ["rclone", "mkdir", remote_target, "--config", str(conf_path)],
         capture_output=True,
@@ -119,7 +115,6 @@ def _mount_via_rclone_secret(
         logger.warning(f"Mount rclone fallito: {mount_proc.stderr.strip()}")
         return None
 
-    # Attende che il filesystem FUSE sia pronto
     for _ in range(40):
         if os.path.ismount(mount_dir):
             logger.info(f"Drive montato senza popup via rclone: {remote_target} -> {mount_dir}")
@@ -182,12 +177,20 @@ class ProjectPaths:
         return self.bronze / "expression_LncBook2.0.csv.gz"
 
     @property
-    def raw_ohnologs_pairs(self) -> Path:
+    def raw_ohnologs_human_list(self) -> Path:
         return self.bronze / "ohnologs" / "homo_sapiens.tsv"
 
     @property
     def raw_ohnologs_genes(self) -> Path:
         return self.bronze / "database" / "genes.tsv"
+
+    @property
+    def raw_ohnologs_pairs(self) -> Path:
+        return self.bronze / "database" / "gene_ohnology.tsv"
+
+    @property
+    def raw_ensembl_genes(self) -> Path:
+        return self.bronze / "ensembl_genes.tsv"
 
     @property
     def raw_ensembl_paralogues(self) -> Path:
@@ -213,6 +216,14 @@ class ProjectPaths:
     @property
     def silver_lncbook_rbp_int(self) -> Path:
         return self.silver / "lncbook_rbp_interactions.parquet"
+
+    @property
+    def silver_lncbook_expr(self) -> Path:
+        return self.silver / "lncbook_expression.parquet"
+
+    @property
+    def silver_ensembl_pc_genes(self) -> Path:
+        return self.silver / "ensembl_protein_coding_genes.parquet"
 
     @property
     def silver_wgd_genes(self) -> Path:
@@ -246,14 +257,18 @@ class ProjectPaths:
             ("Bronze", "LncBook v2.0 miRNA Interactions", self.raw_lncbook_mirna_int),
             ("Bronze", "LncBook v2.0 RBP Interactions", self.raw_lncbook_rbp_int),
             ("Bronze", "LncBook v2.0 Expression", self.raw_lncbook_expr),
-            ("Bronze", "OHNOLOGS v2 Pairs (WGD)", self.raw_ohnologs_pairs),
-            ("Bronze", "OHNOLOGS v2 Genes", self.raw_ohnologs_genes),
-            ("Bronze", "Ensembl Paralogues (SSD)", self.raw_ensembl_paralogues),
+            ("Bronze", "OHNOLOGS Human List", self.raw_ohnologs_human_list),
+            ("Bronze", "OHNOLOGS Genes DB", self.raw_ohnologs_genes),
+            ("Bronze", "OHNOLOGS Pairs DB", self.raw_ohnologs_pairs),
+            ("Bronze", "Ensembl Genes (BioMart)", self.raw_ensembl_genes),
+            ("Bronze", "Ensembl Paralogues (BioMart)", self.raw_ensembl_paralogues),
             ("Silver", "Transcripts Parquet", self.silver_lncrna_transcripts),
             ("Silver", "Genes Parquet", self.silver_lncrna_genes),
             ("Silver", "Conservation Parquet", self.silver_lncbook_cons),
             ("Silver", "miRNA Interactions Parquet", self.silver_lncbook_mirna_int),
             ("Silver", "RBP Interactions Parquet", self.silver_lncbook_rbp_int),
+            ("Silver", "Expression Parquet", self.silver_lncbook_expr),
+            ("Silver", "Ensembl Protein-Coding Parquet", self.silver_ensembl_pc_genes),
             ("Silver", "WGD Genes Parquet", self.silver_wgd_genes),
             ("Silver", "WGD Pairs Parquet", self.silver_wgd_pairs),
             ("Silver", "SSD Pairs Parquet", self.silver_ssd_pairs),
@@ -273,7 +288,7 @@ class ProjectPaths:
 
     def print_status(self) -> None:
         """Stampa l'intera tabella di stato senza troncare righe o percorsi."""
-        with pl.Config(tbl_rows=25, tbl_cols=10, fmt_str_lengths=65):
+        with pl.Config(tbl_rows=30, tbl_cols=10, fmt_str_lengths=65):
             print(self.status_table())
 
 
@@ -287,16 +302,19 @@ def setup_colab(
 ) -> ProjectPaths:
     """
     Inizializza l'ambiente OhnomiTools su Google Colab (o in locale):
-    1. Se `update=True`, forza l'aggiornamento del pacchetto da GitHub.
+    1. Se `update=True`, forza l'aggiornamento senza cache del pacchetto da GitHub.
     2. Su Colab monta silenziosamente Google Drive via rclone leggendo il secret
        `RCLONE_CONF` (zero popup/email); se assente, usa il classico `drive.mount()`.
     3. Attiva `%autoreload 2` nel kernel Jupyter/Colab.
     4. Crea le cartelle Medallion (`bronze/`, `silver/`, `gold/`) e stampa lo stato completo.
     """
     if update:
-        logger.info("Aggiornamento di OhnomiTools da GitHub in corso...")
+        logger.info("Aggiornamento di OhnomiTools da GitHub (no-cache) in corso...")
         subprocess.run(
-            ["pip", "install", "-q", "--no-deps", "--force-reinstall", GITHUB_INSTALL_URL],
+            [
+                "pip", "install", "-q", "--no-cache-dir",
+                "--no-deps", "--force-reinstall", GITHUB_INSTALL_URL,
+            ],
             check=True,
         )
 
