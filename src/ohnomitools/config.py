@@ -25,13 +25,6 @@ GITHUB_INSTALL_URL = "git+https://github.com/ErrPeppe/OhnomiTools.git"
 
 
 def resolve_default_data_root() -> Path:
-    """
-    Ordine di priorità per la cartella dati:
-    1. Variabile d'ambiente `OHNOMI_DATA_DIR` (impostata da setup_colab o dall'utente)
-    2. Mount automatico via rclone su Colab (`/content/rclone_drive`)
-    3. Mount classico di Google Drive su Colab (`/content/drive/MyDrive/UniTo/Tesi/Data`)
-    4. Cartella locale `<repo_root>/data` (se eseguito su PC/workstation locale)
-    """
     env_dir = os.environ.get("OHNOMI_DATA_DIR")
     if env_dir:
         return Path(env_dir).expanduser().resolve()
@@ -52,10 +45,6 @@ def _mount_via_rclone_secret(
     drive_subpath: str | Path,
     mount_dir: Path = DEFAULT_RCLONE_MOUNT,
 ) -> Path | None:
-    """
-    Monta silenziosamente la sola cartella dati su Google Drive tramite rclone
-    usando il secret Colab `RCLONE_CONF` (zero popup e zero email di sicurezza).
-    """
     try:
         from google.colab import userdata  # type: ignore
         rclone_conf = userdata.get(secret_name)
@@ -161,6 +150,10 @@ class ProjectPaths:
         return self.bronze / "lncRNA_LncBookv2.0_GRCh38.gtf.gz"
 
     @property
+    def raw_lncbook_fasta(self) -> Path:
+        return self.bronze / "lncRNA_LncBookv2.0.fa.gz"
+
+    @property
     def raw_lncbook_cons(self) -> Path:
         return self.bronze / "conservation_LncBook2.0.csv.gz"
 
@@ -175,6 +168,14 @@ class ProjectPaths:
     @property
     def raw_lncbook_expr(self) -> Path:
         return self.bronze / "expression_LncBook2.0.csv.gz"
+
+    @property
+    def raw_lncbook_sprotein(self) -> Path:
+        return self.bronze / "sprotein_LncBook2.0.csv.gz"
+
+    @property
+    def raw_lncbook_methylation(self) -> Path:
+        return self.bronze / "methylation_LncBook2.0.csv.gz"
 
     @property
     def raw_ohnologs_human_list(self) -> Path:
@@ -196,7 +197,15 @@ class ProjectPaths:
     def raw_ensembl_paralogues(self) -> Path:
         return self.bronze / "ensembl_paralogues.tsv"
 
-    # --- File Silver (Parquet normalizzati su Google Drive) ---
+    @property
+    def raw_string_info(self) -> Path:
+        return self.bronze / "string" / "9606.protein.info.v12.0.txt.gz"
+
+    @property
+    def raw_string_links(self) -> Path:
+        return self.bronze / "string" / "9606.protein.links.v12.0.txt.gz"
+
+    # --- File Silver Fase 1 (Parquet normalizzati) ---
     @property
     def silver_lncrna_transcripts(self) -> Path:
         return self.silver / "lncbook_transcripts.parquet"
@@ -222,6 +231,14 @@ class ProjectPaths:
         return self.silver / "lncbook_expression.parquet"
 
     @property
+    def silver_lncbook_sprotein(self) -> Path:
+        return self.silver / "lncbook_sprotein.parquet"
+
+    @property
+    def silver_lncbook_methylation(self) -> Path:
+        return self.silver / "lncbook_methylation.parquet"
+
+    @property
     def silver_ensembl_pc_genes(self) -> Path:
         return self.silver / "ensembl_protein_coding_genes.parquet"
 
@@ -237,11 +254,40 @@ class ProjectPaths:
     def silver_ssd_pairs(self) -> Path:
         return self.silver / "ensembl_ssd_pairs.parquet"
 
+    @property
+    def silver_string_ppi(self) -> Path:
+        return self.silver / "string_ppi_edges.parquet"
+
+    # --- File Silver Fase 2 (Coorti delle 3 Vie) ---
+    @property
+    def silver_phylostratigraphy(self) -> Path:
+        return self.silver / "lncbook_gene_phylostratigraphy.parquet"
+
+    @property
+    def silver_host_lncrna_map(self) -> Path:
+        return self.silver / "intragenic_host_lncrna_map.parquet"
+
+    @property
+    def silver_lane1_wgd_pairs(self) -> Path:
+        return self.silver / "wgd_intragenic_lncrna_pairs.parquet"
+
+    @property
+    def silver_lane1_ssd_pairs(self) -> Path:
+        return self.silver / "ssd_intragenic_lncrna_pairs.parquet"
+
+    @property
+    def silver_lane2_wgd_pairs(self) -> Path:
+        return self.silver / "lane2_ab_wgd_pairs.parquet"
+
+    @property
+    def silver_lane2_ssd_pairs(self) -> Path:
+        return self.silver / "lane2_ab_ssd_pairs.parquet"
+
+    @property
+    def silver_lane3_euteleostomi(self) -> Path:
+        return self.silver / "lane3_ramoB_euteleostomi_cohort.parquet"
+
     def save_parquet_safe(self, df: pl.DataFrame, target_drive_path: Path) -> Path:
-        """
-        Scrive il DataFrame Polars sull'SSD locale di Colab (/tmp) compresso in zstd
-        e poi sposta il file nella cartella di Google Drive.
-        """
         target_drive_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = self.scratch / target_drive_path.name
         df.write_parquet(tmp_file, compression="zstd")
@@ -250,28 +296,37 @@ class ProjectPaths:
         return target_drive_path
 
     def status_table(self) -> pl.DataFrame:
-        """Restituisce lo stato di presenza e dimensione (MB) di tutti i dataset."""
         checks = [
             ("Bronze", "LncBook v2.0 GTF", self.raw_lncbook_gtf),
+            ("Bronze", "LncBook v2.0 FASTA", self.raw_lncbook_fasta),
             ("Bronze", "LncBook v2.0 Conservation", self.raw_lncbook_cons),
             ("Bronze", "LncBook v2.0 miRNA Interactions", self.raw_lncbook_mirna_int),
             ("Bronze", "LncBook v2.0 RBP Interactions", self.raw_lncbook_rbp_int),
             ("Bronze", "LncBook v2.0 Expression", self.raw_lncbook_expr),
+            ("Bronze", "LncBook v2.0 Small Protein", self.raw_lncbook_sprotein),
+            ("Bronze", "LncBook v2.0 Methylation", self.raw_lncbook_methylation),
             ("Bronze", "OHNOLOGS Human List", self.raw_ohnologs_human_list),
             ("Bronze", "OHNOLOGS Genes DB", self.raw_ohnologs_genes),
             ("Bronze", "OHNOLOGS Pairs DB", self.raw_ohnologs_pairs),
             ("Bronze", "Ensembl Genes (BioMart)", self.raw_ensembl_genes),
             ("Bronze", "Ensembl Paralogues (BioMart)", self.raw_ensembl_paralogues),
-            ("Silver", "Transcripts Parquet", self.silver_lncrna_transcripts),
-            ("Silver", "Genes Parquet", self.silver_lncrna_genes),
-            ("Silver", "Conservation Parquet", self.silver_lncbook_cons),
-            ("Silver", "miRNA Interactions Parquet", self.silver_lncbook_mirna_int),
-            ("Silver", "RBP Interactions Parquet", self.silver_lncbook_rbp_int),
-            ("Silver", "Expression Parquet", self.silver_lncbook_expr),
-            ("Silver", "Ensembl Protein-Coding Parquet", self.silver_ensembl_pc_genes),
-            ("Silver", "WGD Genes Parquet", self.silver_wgd_genes),
-            ("Silver", "WGD Pairs Parquet", self.silver_wgd_pairs),
-            ("Silver", "SSD Pairs Parquet", self.silver_ssd_pairs),
+            ("Bronze", "STRING v12.0 PPI Links", self.raw_string_links),
+            ("Silver-1", "Transcripts Parquet", self.silver_lncrna_transcripts),
+            ("Silver-1", "Genes Parquet", self.silver_lncrna_genes),
+            ("Silver-1", "Conservation Parquet", self.silver_lncbook_cons),
+            ("Silver-1", "miRNA Interactions Parquet", self.silver_lncbook_mirna_int),
+            ("Silver-1", "RBP Interactions Parquet", self.silver_lncbook_rbp_int),
+            ("Silver-1", "Expression Parquet", self.silver_lncbook_expr),
+            ("Silver-1", "Small Protein Parquet", self.silver_lncbook_sprotein),
+            ("Silver-1", "Methylation Parquet", self.silver_lncbook_methylation),
+            ("Silver-1", "Ensembl Protein-Coding Parquet", self.silver_ensembl_pc_genes),
+            ("Silver-1", "WGD Genes Parquet", self.silver_wgd_genes),
+            ("Silver-1", "WGD Pairs Parquet", self.silver_wgd_pairs),
+            ("Silver-1", "SSD Pairs Parquet", self.silver_ssd_pairs),
+            ("Silver-1", "STRING PPI Parquet", self.silver_string_ppi),
+            ("Silver-2", "Via 1 WGD Pairs (Ramo A)", self.silver_lane1_wgd_pairs),
+            ("Silver-2", "Via 2 WGD Pairs (A ∩ B)", self.silver_lane2_wgd_pairs),
+            ("Silver-2", "Via 3 Cohort (Ramo B Eut.)", self.silver_lane3_euteleostomi),
         ]
         rows = []
         for layer, label, path in checks:
@@ -287,8 +342,7 @@ class ProjectPaths:
         return pl.DataFrame(rows)
 
     def print_status(self) -> None:
-        """Stampa l'intera tabella di stato senza troncare righe o percorsi."""
-        with pl.Config(tbl_rows=30, tbl_cols=10, fmt_str_lengths=65):
+        with pl.Config(tbl_rows=40, tbl_cols=10, fmt_str_lengths=65):
             print(self.status_table())
 
 
@@ -300,14 +354,6 @@ def setup_colab(
     update: bool = False,
     show_status: bool = True,
 ) -> ProjectPaths:
-    """
-    Inizializza l'ambiente OhnomiTools su Google Colab (o in locale):
-    1. Se `update=True`, forza l'aggiornamento senza cache del pacchetto da GitHub.
-    2. Su Colab monta silenziosamente Google Drive via rclone leggendo il secret
-       `RCLONE_CONF` (zero popup/email); se assente, usa il classico `drive.mount()`.
-    3. Attiva `%autoreload 2` nel kernel Jupyter/Colab.
-    4. Crea le cartelle Medallion (`bronze/`, `silver/`, `gold/`) e stampa lo stato completo.
-    """
     if update:
         logger.info("Aggiornamento di OhnomiTools da GitHub (no-cache) in corso...")
         subprocess.run(
