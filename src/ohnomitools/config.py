@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import polars as pl
 
 logging.basicConfig(
@@ -17,25 +18,116 @@ logging.basicConfig(
 logger = logging.getLogger("OhnomiTools")
 
 DEFAULT_DRIVE_SUBPATH = Path("UniTo/Tesi/Data")
-DEFAULT_COLAB_REPO_DIR = Path("/content/OhnomiTools")
+DEFAULT_RCLONE_MOUNT = Path("/content/rclone_drive")
+DEFAULT_RCLONE_REMOTE = "gdrive"
+DEFAULT_RCLONE_SECRET = "RCLONE_CONF"
+GITHUB_INSTALL_URL = "git+https://github.com/ErrPeppe/OhnomiTools.git"
 
 
 def resolve_default_data_root() -> Path:
     """
     Ordine di priorità per la cartella dati:
     1. Variabile d'ambiente `OHNOMI_DATA_DIR` (impostata da setup_colab o dall'utente)
-    2. Google Drive montato su Colab (`/content/drive/MyDrive/UniTo/Tesi/Data`)
-    3. Cartella locale `<repo_root>/data` (se eseguito su PC/workstation locale)
+    2. Mount automatico via rclone su Colab (`/content/rclone_drive`)
+    3. Mount classico di Google Drive su Colab (`/content/drive/MyDrive/UniTo/Tesi/Data`)
+    4. Cartella locale `<repo_root>/data` (se eseguito su PC/workstation locale)
     """
     env_dir = os.environ.get("OHNOMI_DATA_DIR")
     if env_dir:
         return Path(env_dir).expanduser().resolve()
 
+    if os.path.ismount(DEFAULT_RCLONE_MOUNT):
+        return DEFAULT_RCLONE_MOUNT
+
     colab_drive_mount = Path("/content/drive/MyDrive")
     if colab_drive_mount.exists():
         return colab_drive_mount / DEFAULT_DRIVE_SUBPATH
 
-    return Path(__file__).resolve().parent.parent / "data"
+    return Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def _mount_via_rclone_secret(
+    secret_name: str,
+    remote_name: str,
+    drive_subpath: str | Path,
+    mount_dir: Path = DEFAULT_RCLONE_MOUNT,
+) -> Path | None:
+    """
+    Monta silenziosamente la sola cartella dati su Google Drive tramite rclone
+    usando il secret Colab `RCLONE_CONF` (zero popup e zero email di sicurezza).
+    Restituisce il Path montato oppure None se il secret non è configurato.
+    """
+    try:
+        from google.colab import userdata  # type: ignore
+        rclone_conf = userdata.get(secret_name)
+    except Exception:
+        return None
+
+    if not rclone_conf or not rclone_conf.strip():
+        return None
+
+    if os.path.ismount(mount_dir):
+        logger.info(f"Cartella Drive già montata via rclone in {mount_dir}")
+        return mount_dir
+
+    # Installa rclone e fuse3 se non presenti sul runtime Colab
+    if shutil.which("rclone") is None or (
+        shutil.which("fusermount3") is None and shutil.which("fusermount") is None
+    ):
+        logger.info("Installazione di rclone e fuse3 sul runtime Colab...")
+        subprocess.run(["apt-get", "update", "-qq"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "rclone", "fuse3"], check=True)
+
+    # Scrive temporaneamente rclone.conf con permessi ristretti (solo proprietario)
+    conf_path = Path("/root/.config/rclone/rclone.conf")
+    conf_path.parent.mkdir(parents=True, exist_ok=True)
+    conf_path.write_text(rclone_conf.strip() + "\n", encoding="utf-8")
+    os.chmod(conf_path, 0o600)
+
+    subpath_str = Path(drive_subpath).as_posix().strip("/")
+    remote_target = f"{remote_name}:{subpath_str}"
+
+    # Garantisce che la cartella di destinazione esista su Drive prima del mount
+    mkdir_proc = subprocess.run(
+        ["rclone", "mkdir", remote_target, "--config", str(conf_path)],
+        capture_output=True,
+        text=True,
+    )
+    if mkdir_proc.returncode != 0:
+        logger.warning(
+            f"Impossibile accedere a '{remote_target}' con rclone: {mkdir_proc.stderr.strip()}"
+        )
+        return None
+
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(tempfile.gettempdir()) / "rclone_vfs_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    mount_cmd = [
+        "rclone",
+        "mount",
+        remote_target,
+        str(mount_dir),
+        "--config", str(conf_path),
+        "--vfs-cache-mode", "writes",
+        "--vfs-write-back", "1s",
+        "--cache-dir", str(cache_dir),
+        "--daemon",
+    ]
+    mount_proc = subprocess.run(mount_cmd, capture_output=True, text=True)
+    if mount_proc.returncode != 0:
+        logger.warning(f"Mount rclone fallito: {mount_proc.stderr.strip()}")
+        return None
+
+    # Attende che il filesystem FUSE sia pronto
+    for _ in range(40):
+        if os.path.ismount(mount_dir):
+            logger.info(f"Drive montato senza popup via rclone: {remote_target} -> {mount_dir}")
+            return mount_dir
+        time.sleep(0.25)
+
+    logger.warning("Timeout attesa mount rclone; passo al fallback drive.mount().")
+    return None
 
 
 @dataclass(frozen=True)
@@ -137,7 +229,7 @@ class ProjectPaths:
     def save_parquet_safe(self, df: pl.DataFrame, target_drive_path: Path) -> Path:
         """
         Scrive il DataFrame Polars sull'SSD locale di Colab (/tmp) compresso in zstd
-        e poi sposta atomicamente il file nella cartella di Google Drive.
+        e poi sposta il file nella cartella di Google Drive.
         """
         target_drive_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = self.scratch / target_drive_path.name
@@ -147,7 +239,7 @@ class ProjectPaths:
         return target_drive_path
 
     def status_table(self) -> pl.DataFrame:
-        """Restituisce lo stato di presenza e dimensione (MB) dei dataset Bronze e Silver."""
+        """Restituisce lo stato di presenza e dimensione (MB) di tutti i dataset."""
         checks = [
             ("Bronze", "LncBook v2.0 GTF", self.raw_lncbook_gtf),
             ("Bronze", "LncBook v2.0 Conservation", self.raw_lncbook_cons),
@@ -179,33 +271,57 @@ class ProjectPaths:
             })
         return pl.DataFrame(rows)
 
+    def print_status(self) -> None:
+        """Stampa l'intera tabella di stato senza troncare righe o percorsi."""
+        with pl.Config(tbl_rows=25, tbl_cols=10, fmt_str_lengths=65):
+            print(self.status_table())
+
 
 def setup_colab(
     drive_subpath: str | Path = DEFAULT_DRIVE_SUBPATH,
     mount_point: str = "/content/drive",
-    auto_pull_repo: str | Path | None = DEFAULT_COLAB_REPO_DIR,
+    rclone_secret: str | None = DEFAULT_RCLONE_SECRET,
+    rclone_remote: str = DEFAULT_RCLONE_REMOTE,
+    update: bool = False,
     show_status: bool = True,
 ) -> ProjectPaths:
     """
-    Inizializza l'ambiente OhnomiTools su Google Colab o in locale:
-    1. Monta Google Drive e punta a `/content/drive/MyDrive/UniTo/Tesi/Data` (o `drive_subpath`).
-    2. Esegue `git pull` sul clone locale della libreria `/content/OhnomiTools` se presente.
+    Inizializza l'ambiente OhnomiTools su Google Colab (o in locale):
+    1. Se `update=True`, forza l'aggiornamento del pacchetto da GitHub.
+    2. Su Colab monta silenziosamente Google Drive via rclone leggendo il secret
+       `RCLONE_CONF` (zero popup/email); se assente, usa il classico `drive.mount()`.
     3. Attiva `%autoreload 2` nel kernel Jupyter/Colab.
-    4. Crea le directory Medallion (`bronze/`, `silver/`, `gold/`) e verifica i dataset.
+    4. Crea le cartelle Medallion (`bronze/`, `silver/`, `gold/`) e stampa lo stato completo.
     """
+    if update:
+        logger.info("Aggiornamento di OhnomiTools da GitHub in corso...")
+        subprocess.run(
+            ["pip", "install", "-q", "--no-deps", "--force-reinstall", GITHUB_INSTALL_URL],
+            check=True,
+        )
+
     try:
         from google.colab import drive  # type: ignore
-        mount_path = Path(mount_point)
-        if not (mount_path / "MyDrive").exists():
-            logger.info("Montaggio di Google Drive in corso...")
-            drive.mount(mount_point)
-        data_root = mount_path / "MyDrive" / Path(drive_subpath)
-        os.environ["OHNOMI_DATA_DIR"] = str(data_root)
+
+        mounted_rclone: Path | None = None
+        if rclone_secret:
+            mounted_rclone = _mount_via_rclone_secret(
+                secret_name=rclone_secret,
+                remote_name=rclone_remote,
+                drive_subpath=drive_subpath,
+            )
+
+        if mounted_rclone is not None:
+            os.environ["OHNOMI_DATA_DIR"] = str(mounted_rclone)
+        else:
+            mount_path = Path(mount_point)
+            if not (mount_path / "MyDrive").exists():
+                logger.info("Secret rclone non trovato: montaggio classico di Google Drive...")
+                drive.mount(mount_point)
+            data_root = mount_path / "MyDrive" / Path(drive_subpath)
+            os.environ["OHNOMI_DATA_DIR"] = str(data_root)
     except ImportError:
         logger.info("Esecuzione fuori da Google Colab: utilizzo storage locale.")
-
-    if auto_pull_repo and Path(auto_pull_repo).exists():
-        subprocess.run(["git", "-C", str(auto_pull_repo), "pull", "-q"], check=False)
 
     try:
         from IPython import get_ipython  # type: ignore
@@ -221,7 +337,7 @@ def setup_colab(
 
     logger.info(f"OhnomiTools Data Root attiva: {paths.data_root}")
     if show_status:
-        print(paths.status_table())
+        paths.print_status()
 
     return paths
 
