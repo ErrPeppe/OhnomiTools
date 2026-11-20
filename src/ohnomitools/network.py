@@ -56,10 +56,6 @@ class NetworkMotifAnalyzer:
         min_rbp_sites: int = 1,
         min_rbp_cell_lines: int = 1,
     ) -> pl.DataFrame:
-        """
-        Carica e deduplica a livello di gene `(lncrna_id, target_id)` gli archi del layer
-        richiesto (`"rbp"` oppure `"mirna"`).
-        """
         if layer == "rbp":
             pq_path = self.paths.silver_lncbook_rbp_int
             if not pq_path.exists():
@@ -103,17 +99,19 @@ class NetworkMotifAnalyzer:
             df_head = pl.read_parquet(pq_path, n_rows=20)
             cols = df_head.columns
 
-            # Rileva automaticamente la colonna Gene ID (HSALNG...) e la colonna miRNA
-            gene_col = next((c for c in cols if "gene" in c.lower()), None)
-            if gene_col is None:
+            if "gene_id" in cols and "mirna_id" in cols:
+                gene_col, mir_col = "gene_id", "mirna_id"
+            else:
+                # Fallback sicuro basato sui valori reali (mai sui nomi colonna)
                 gene_col = next(
                     (c for c in cols if df_head[c].cast(pl.Utf8).str.starts_with("HSALNG").any()),
                     cols[0],
                 )
-            mir_col = next((c for c in cols if "mir" in c.lower()), None)
-            if mir_col is None:
                 mir_col = next(
-                    (c for c in cols if df_head[c].cast(pl.Utf8).str.contains("miR|let-").any()),
+                    (
+                        c for c in cols
+                        if df_head[c].cast(pl.Utf8).str.contains(r"(?i)^hsa-(mir|let)-").any()
+                    ),
                     cols[-1],
                 )
 
@@ -128,6 +126,7 @@ class NetworkMotifAnalyzer:
                     & pl.col("target_id").is_not_null()
                     & (pl.col("lncrna_id") != "")
                     & (pl.col("target_id") != "")
+                    & (pl.col("target_id") != "-")
                 )
                 .group_by(["lncrna_id", "target_id"])
                 .agg(pl.len().alias("n_sites"))
@@ -144,10 +143,6 @@ class NetworkMotifAnalyzer:
         min_rbp_sites: int = 1,
         min_rbp_cell_lines: int = 1,
     ) -> BipartiteNetwork:
-        """
-        Costruisce il grafo bipartito compatto CSR e, se `layer == 'rbp'`, carica anche
-        la matrice di adiacenza PPI (STRING) e la matrice di paralogia (WGD/SSD) tra RBP.
-        """
         df_edges = self._load_bipartite_edges(
             layer=layer,
             min_rbp_sites=min_rbp_sites,
@@ -178,7 +173,6 @@ class NetworkMotifAnalyzer:
         offsets = np.zeros(n_u + 1, dtype=np.int32)
         offsets[1:] = np.cumsum(degrees_u)
 
-        # Matrici PPI (STRING) e paralogia bersagli (solo su layer proteico RBP)
         use_ppi = False
         use_dup = False
         n_ppi_mapped = 0
@@ -204,7 +198,6 @@ class NetworkMotifAnalyzer:
                         n_ppi_mapped += 1
                 use_ppi = n_ppi_mapped > 0
 
-            # Mappa eventuali coppie di RBP paraloghe (WGD o SSD)
             dup_mat = np.zeros((n_v, n_v), dtype=np.uint8)
             for dup_pq in [self.paths.silver_wgd_pairs, self.paths.silver_ssd_pairs]:
                 if dup_pq.exists():
@@ -250,9 +243,6 @@ class NetworkMotifAnalyzer:
         strict_1to1_only: bool = False,
         dedup_lncrna_pair_key: bool = True,
     ) -> pl.DataFrame:
-        """
-        Carica le coppie di lncRNA della Via 1 (Ramo A) o della Via 2 (A ∩ B, >=15 Amniota).
-        """
         if lane == "via1":
             pq = self.paths.silver_lane1_wgd_pairs if dup_type == "WGD" else self.paths.silver_lane1_ssd_pairs
             df = pl.read_parquet(pq)
@@ -273,13 +263,6 @@ class NetworkMotifAnalyzer:
         return df
 
     def analyze_degree_distributions(self, net: BipartiteNetwork) -> dict[str, pl.DataFrame]:
-        """
-        Confronta la distribuzione del grado uscente k_out (e copertura in rete) su tutte e 3 le Vie:
-        - Via 1: lncRNA intragenici WGD vs SSD antiche vs Background (tutti i lncRNA in rete).
-        - Via 2: lncRNA intragenici A ∩ B (>=15 Amniota) WGD vs SSD antiche.
-        - Via 3: Coorte 17. Euteleostomi (`intragenic_WGD_host`, `intragenic_other_host`,
-          `intergenic_lincRNA`) vs nodi recenti (`12. Eutheria`, `1. Homo`).
-        """
         df_deg = pl.DataFrame({
             "lncrna_id": net.u_names,
             "k_out": net.degrees_u.astype(np.int64),
@@ -338,7 +321,6 @@ class NetworkMotifAnalyzer:
                 "k_max": int(np.max(arr)) if n_in_net else 0,
             })
 
-        # Test KS & Mann-Whitney tra coppie chiave di coorti
         comparisons = [
             ("Via 1: WGD vs SSD_ancient", "WGD_intragenic", "SSD_ancient_intragenic"),
             ("Via 2 (A∩B): WGD vs SSD_ancient", "WGD_AB_ancient", "SSD_AB_ancient"),
@@ -384,13 +366,6 @@ class NetworkMotifAnalyzer:
         strict_1to1_only: bool = False,
         max_ssd_pairs_for_null: int | None = None,
     ) -> dict[str, pl.DataFrame | dict]:
-        """
-        Calcola per `lane` ('via1' o 'via2') su WGD e SSD antiche:
-        - Coppie mappate in rete (entrambi i lncRNA con k_out > 0)
-        - V-motifs, Sørensen-Dice, Jaccard, ΔDegree, Simple Bifans, Duplicated Bifans, PPI-Bifans
-        - Modello nullo microcanonico di Maslov-Sneppen (`n_null` repliche) con Z-score globale
-          e Z-score per singola coppia (stile Agasso et al. Fig. 3).
-        """
         results_rows: list[dict] = []
         pair_tables: dict[str, pl.DataFrame] = {}
         null_dists: dict[str, dict[str, np.ndarray]] = {}
@@ -458,15 +433,16 @@ class NetworkMotifAnalyzer:
                 "ppi_bifans": null_pb,
             }
 
-            # Z-score per singola coppia (se tracciato)
             if track_pp:
                 pv_mean = pv_sum / n_null
                 pv_std = np.sqrt(np.clip((pv_sq - n_null * pv_mean * pv_mean) / max(1, n_null - 1), 0.0, None))
-                pair_v_z = np.where(pv_std > 1e-12, (obs_v - pv_mean) / pv_std, 0.0)
+                pair_v_z = np.zeros(n_in_net, dtype=np.float64)
+                np.divide(obs_v - pv_mean, pv_std, out=pair_v_z, where=pv_std > 1e-12)
 
                 ppb_mean = ppb_sum / n_null
                 ppb_std = np.sqrt(np.clip((ppb_sq - n_null * ppb_mean * ppb_mean) / max(1, n_null - 1), 0.0, None))
-                pair_pb_z = np.where(ppb_std > 1e-12, (obs_pb - ppb_mean) / ppb_std, 0.0)
+                pair_pb_z = np.zeros(n_in_net, dtype=np.float64)
+                np.divide(obs_pb - ppb_mean, ppb_std, out=pair_pb_z, where=ppb_std > 1e-12)
             else:
                 pair_v_z = np.full(n_in_net, np.nan)
                 pair_pb_z = np.full(n_in_net, np.nan)
@@ -494,7 +470,6 @@ class NetworkMotifAnalyzer:
             ])
             pair_tables[dup_type] = df_pairs_out
 
-            # Calcolo Z-score globali per tutte le metriche
             metric_specs = [
                 ("V-Motifs (totale)", float(obs_v.sum()), null_v),
                 ("Mean Sørensen-Dice", float(obs_dice.mean()), null_dice),
@@ -528,11 +503,10 @@ class NetworkMotifAnalyzer:
         suffix = f"{net.layer_name}_{lane}" + ("_1to1" if strict_1to1_only else "")
         df_z_summary.write_csv(self.paths.gold / f"phase3_{suffix}_null_zscores.csv")
 
-        # Confronto diretto WGD vs SSD su Sørensen-Dice, Jaccard, ΔDegree e V-motifs (KS + MW)
         comp_rows = []
         if "WGD" in pair_tables and "SSD" in pair_tables:
             tw, ts = pair_tables["WGD"], pair_tables["SSD"]
-            for col in ["sorensen_dice", "jaccard", "v_motifs", "norm_delta_k", "ppi_bifans"]:
+            for col in ["sorensen_dice", "jaccard", "v_motifs", "simple_bifans", "norm_delta_k", "ppi_bifans"]:
                 if col == "ppi_bifans" and not net.use_ppi:
                     continue
                 aw = tw[col].to_numpy().astype(np.float64)
@@ -554,7 +528,6 @@ class NetworkMotifAnalyzer:
                     "MW_p": float(mw_p),
                 })
 
-            # Salva le tabelle per coppia WGD in Silver/Gold per casi studio e Fase 4
             self.paths.save_parquet_safe(tw, self.paths.silver / f"phase3_{suffix}_wgd_pair_metrics.parquet")
 
         df_comp = pl.DataFrame(comp_rows)
@@ -576,15 +549,6 @@ class NetworkMotifAnalyzer:
         step_factor: int = 2,
         seed: int = 123,
     ) -> pl.DataFrame:
-        """
-        Analisi specifica per la Via 3 (Ramo B — Coorte `17. Euteleostomi`) sul Layer RBP:
-        calcola i motivi PPI-Delta (singolo lncRNA che lega due RBP fisicamente interagenti
-        in STRING, stile Agasso et al. Fig. 3D) e il relativo Z-score di Maslov-Sneppen per:
-        - `intragenic_WGD_host`
-        - `intragenic_other_host`
-        - `intergenic_lincRNA`
-        - controlli recenti (`12. Eutheria` e `1. Homo`).
-        """
         if not net.use_ppi:
             raise ValueError("PPI-Delta richiede un layer proteico con matrice STRING PPI attiva.")
 
@@ -639,13 +603,6 @@ class NetworkMotifAnalyzer:
         res_via2: dict,
         save_fig: bool = True,
     ) -> tuple[Path | None, Path | None]:
-        """
-        Genera una figura diagnostica a 3 pannelli (salvata in `gold/` .png e .pdf):
-        - A) Distribuzione dell'indice di Sørensen-Dice (WGD vs SSD antiche, Via 1 e Via 2).
-        - B) Confronto degli Z-score microcanonici di Maslov-Sneppen (Via 2: WGD vs SSD).
-        - C) Topologia delle coppie WGD Via 2: Sørensen-Dice vs ΔDegree normalizzato
-             (ridondanza conservata vs neofunzionalizzazione asimmetrica).
-        """
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2), dpi=140)
@@ -656,6 +613,7 @@ class NetworkMotifAnalyzer:
         labels_a = ["Via 1 (Ramo A)\nWGD", "Via 1 (Ramo A)\nSSD ant.", "Via 2 (A ∩ B)\nWGD", "Via 2 (A ∩ B)\nSSD ant."]
         vals_a = []
         errs_a = []
+        counts_a = []
         colors_a = ["#D62728", "#1F77B4", "#B2182B", "#4393C3"]
         for res in (res_via1, res_via2):
             for dt in ("WGD", "SSD"):
@@ -663,14 +621,17 @@ class NetworkMotifAnalyzer:
                     arr = res["pair_tables"][dt]["sorensen_dice"].to_numpy()
                     vals_a.append(float(np.mean(arr)))
                     errs_a.append(float(1.96 * np.std(arr) / np.sqrt(max(1, len(arr)))))
+                    counts_a.append(len(arr))
                 else:
                     vals_a.append(0.0)
                     errs_a.append(0.0)
+                    counts_a.append(0)
 
         x_a = np.arange(len(labels_a))
         ax.bar(x_a, vals_a, yerr=errs_a, capsize=4, color=colors_a, alpha=0.88, edgecolor="black", linewidth=0.7)
+        x_labels_n = [f"{lbl}\n(n={n})" for lbl, n in zip(labels_a, counts_a)]
         ax.set_xticks(x_a)
-        ax.set_xticklabels(labels_a, fontsize=8.8)
+        ax.set_xticklabels(x_labels_n, fontsize=8.3)
         ax.set_ylabel("Indice di Sørensen–Dice medio (± CI 95%)", fontsize=9.5)
         ax.set_title(f"A) Ridondanza Target — Layer {net.layer_name.upper()}\n(WGD vs SSD Antiche)", fontsize=10.2, fontweight="bold")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
@@ -704,17 +665,22 @@ class NetworkMotifAnalyzer:
 
         # --- Pannello C: Scatter Topologico Via 2 WGD (Sørensen-Dice vs ΔDegree norm.) ---
         ax = axes[2]
-        if "WGD" in res_via2["pair_tables"]:
+        if "WGD" in res_via2["pair_tables"] and len(res_via2["pair_tables"]["WGD"]) > 0:
             tw2 = res_via2["pair_tables"]["WGD"]
             x_c = tw2["sorensen_dice"].to_numpy()
             y_c = tw2["norm_delta_k"].to_numpy()
             c_val = tw2["ppi_bifans"].to_numpy() if net.use_ppi else tw2["v_motifs"].to_numpy()
             sc = ax.scatter(
                 x_c, y_c, c=np.log1p(c_val), cmap="viridis",
-                s=28, alpha=0.78, edgecolors="k", linewidths=0.3
+                s=34, alpha=0.82, edgecolors="k", linewidths=0.35
             )
             cbar_lbl = "log(1 + PPI-Bifans)" if net.use_ppi else "log(1 + V-Motifs)"
             fig.colorbar(sc, ax=ax, label=cbar_lbl)
+        else:
+            ax.text(
+                0.5, 0.5, "Nessuna coppia WGD con entrambi\ni membri mappati in questo layer",
+                ha="center", va="center", fontsize=9.5, color="gray", transform=ax.transAxes
+            )
         ax.set_xlabel("Similarità Target (Sørensen–Dice)", fontsize=9.5)
         ax.set_ylabel("Asimmetria di Grado $|k_1 - k_2| / (k_1 + k_2)$", fontsize=9.5)
         ax.set_title(f"C) Ridondanza vs Neofunzionalizzazione\n(Coppie WGD Via 2 — {net.layer_name.upper()})", fontsize=10.2, fontweight="bold")
