@@ -1,4 +1,9 @@
 # src/ohnomitools/reporting.py
+"""
+Esportazione riproducibile di metriche numeriche e tabelle LaTeX (booktabs)
+in `Data/gold/latex_auto/` per l'aggiornamento automatico di tesi e articoli.
+"""
+
 from __future__ import annotations
 
 import json
@@ -6,6 +11,7 @@ import logging
 import math
 import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,39 +37,71 @@ _LATEX_ESCAPE_MAP = {
 
 
 def escape_latex(text: str) -> str:
-    """Esegue l'escape dei caratteri speciali LaTeX nelle celle di testo."""
+    """Esegue l'escape dei caratteri speciali LaTeX nelle celle testuali."""
     return "".join(_LATEX_ESCAPE_MAP.get(ch, ch) for ch in text)
 
 
 def format_int(value: int) -> str:
-    """Formatta interi con separatore migliaia in stile inglese LaTeX: 4221 -> 4{,}221."""
+    """Formatta interi con separatore migliaia inglese per LaTeX: 4221 -> '4{,}221'."""
     return f"{int(value):,}".replace(",", "{,}")
 
 
 def format_float(value: float, decimals: int = 2) -> str:
-    """Formatta float con numero fisso di decimali."""
-    return f"{float(value):.{decimals}f}"
+    """Formatta un numero in virgola mobile con decimali fissi."""
+    val = float(value)
+    if math.isnan(val):
+        return "--"
+    return f"{val:.{decimals}f}"
+
+
+def format_pct(value: float, decimals: int = 1, is_fraction: bool = False) -> str:
+    """
+    Formatta una percentuale per LaTeX.
+    Esempi: format_pct(51.12) -> '51.1\\%'; format_pct(0.5112, is_fraction=True) -> '51.1\\%'.
+    """
+    val = float(value)
+    if math.isnan(val):
+        return "--"
+    if is_fraction:
+        val *= 100.0
+    return rf"{val:.{decimals}f}\%"
 
 
 def format_pvalue(p: float, sig_digits: int = 2) -> str:
     """
-    Formatta un p-value per la modalità matematica LaTeX:
-    es. 3.06e-10 -> 3.06 \times 10^{-10}; 0.042 -> 0.042.
+    Formatta un p-value per la modalità matematica LaTeX.
+    Esempi: 3.06e-10 -> '3.06 \\times 10^{-10}'; 0.042 -> '0.042'.
     """
-    p = float(p)
-    if p == 0.0:
+    val = float(p)
+    if math.isnan(val):
+        return "--"
+    if val <= 0.0:
         return r"< 10^{-300}"
-    if p >= 1e-3:
-        return f"{p:.3f}"
-    exp = int(math.floor(math.log10(abs(p))))
-    mant = p / (10**exp)
+    if val >= 1e-3:
+        return f"{val:.3f}"
+    exp = int(math.floor(math.log10(abs(val))))
+    mant = val / (10**exp)
     return rf"{mant:.{sig_digits}f} \times 10^{{{exp}}}"
+
+
+def format_ci(est: float, low: float, high: float, decimals: int = 2) -> str:
+    """
+    Formatta stima puntuale e intervallo di confidenza per la modalità matematica LaTeX.
+    Esempio: format_ci(1.28, 1.19, 1.38) -> '1.28\\;[1.19,\\,1.38]'.
+    """
+    vals = (float(est), float(low), float(high))
+    if any(math.isnan(v) for v in vals):
+        return "--"
+    return (
+        rf"{vals[0]:.{decimals}f}\;"
+        rf"[{vals[1]:.{decimals}f},\,{vals[2]:.{decimals}f}]"
+    )
 
 
 class LatexExporter:
     """
-    Esporta metriche numeriche (metrics.tex) e tabelle booktabs (tab_*.tex)
-    nella cartella `gold/latex_auto/` tramite scritture atomiche su /tmp.
+    Esporta metriche numeriche (`metrics.tex`) e frammenti di tabelle `booktabs`
+    (`tab_*.tex`) nella cartella `gold/latex_auto/` tramite scritture atomiche su scratch.
     """
 
     def __init__(self, paths: ProjectPaths = PATHS, subdir: str = "latex_auto") -> None:
@@ -75,15 +113,20 @@ class LatexExporter:
 
     def _atomic_write_text(self, content: str, target_path: Path) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.paths.scratch / target_path.name
+        self.paths.scratch.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.paths.scratch / f"{target_path.name}.tmp"
         tmp_path.write_text(content, encoding="utf-8")
         shutil.move(str(tmp_path), str(target_path))
         return target_path
 
-    def update_metrics(self, metrics: dict[str, str], source_tag: str = "notebook") -> Path:
+    def update_metrics(
+        self,
+        metrics: dict[str, str],
+        source_tag: str = "notebook",
+    ) -> Path:
         """
         Aggiorna in modo incrementale `metrics_store.json` e rigenera `metrics.tex`.
-        Ogni chiave deve contenere solo lettere ASCII (es. 'NWGDPairs', 'ORAdjViaOne').
+        Ogni chiave deve contenere solo lettere ASCII [A-Za-z] (vincolo LaTeX per macro).
         """
         for cmd in metrics:
             if not _LATEX_CMD_RE.match(cmd):
@@ -96,8 +139,13 @@ class LatexExporter:
         if self.store_path.exists():
             store = json.loads(self.store_path.read_text(encoding="utf-8"))
 
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for cmd, val in metrics.items():
-            store[cmd] = {"value": str(val), "source": source_tag}
+            store[cmd] = {
+                "value": str(val),
+                "source": source_tag,
+                "updated_at": now_utc,
+            }
 
         self._atomic_write_text(
             json.dumps(store, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
@@ -106,21 +154,50 @@ class LatexExporter:
 
         lines = [
             "% ==========================================================================",
-            "% AUTO-GENERATED BY OhnomiTools (reporting.py) — DO NOT EDIT MANUALLY",
+            "% AUTO-GENERATED BY OhnomiTools (reporting.py) -- DO NOT EDIT MANUALLY",
             "% ==========================================================================",
         ]
         for cmd in sorted(store):
             entry = store[cmd]
+            meta = f"{entry.get('source', '')} | {entry.get('updated_at', '')}".strip(" |")
             lines.append(
-                f"\\providecommand{{\\{cmd}}}{{{entry['value']}}} % [{entry['source']}]"
+                f"\\providecommand{{\\{cmd}}}{{{entry['value']}}} % [{meta}]"
             )
 
         self._atomic_write_text("\n".join(lines) + "\n", self.metrics_tex_path)
         logger.info(
-            f"Aggiornate {len(metrics)} macro in {self.metrics_tex_path.name} "
-            f"(totale registro: {len(store)})."
+            "Aggiornate %d macro in %s (totale registro: %d).",
+            len(metrics),
+            self.metrics_tex_path.name,
+            len(store),
         )
         return self.metrics_tex_path
+
+    def summary(self) -> pl.DataFrame:
+        """
+        Restituisce un DataFrame Polars con tutte le macro registrate, il notebook
+        sorgente e il timestamp UTC di ultimo aggiornamento.
+        """
+        schema = {
+            "macro": pl.Utf8,
+            "value": pl.Utf8,
+            "source": pl.Utf8,
+            "updated_at": pl.Utf8,
+        }
+        if not self.store_path.exists():
+            return pl.DataFrame(schema=schema)
+
+        store = json.loads(self.store_path.read_text(encoding="utf-8"))
+        rows = [
+            {
+                "macro": f"\\{cmd}",
+                "value": str(entry.get("value", "")),
+                "source": str(entry.get("source", "")),
+                "updated_at": str(entry.get("updated_at", "")),
+            }
+            for cmd, entry in sorted(store.items())
+        ]
+        return pl.DataFrame(rows, schema=schema)
 
     def save_booktabs_table(
         self,
@@ -130,26 +207,50 @@ class LatexExporter:
         headers: list[str] | None = None,
         raw_columns: set[str] | None = None,
         float_decimals: int = 3,
+        fit_width: bool = False,
     ) -> Path:
         """
-        Esporta un DataFrame Polars come frammento LaTeX `tabular` in stile booktabs.
-        L'ambiente `table`, `\caption` e `\label` restano nel file `.tex` del capitolo.
+        Esporta un DataFrame Polars come frammento LaTeX `tabular` in stile `booktabs`.
+        L'ambiente `table`, `\\caption` e `\\label` restano nel file `.tex` del capitolo.
+
+        Parameters
+        ----------
+        df : pl.DataFrame
+            Tabella da esportare.
+        filename : str
+            Nome del file di destinazione dentro `gold/latex_auto/` (es. 'tab_enrichment.tex').
+        col_align : str | None
+            Specifica di allineamento colonne LaTeX (default: 'l' + 'r'*(n_cols-1)).
+        headers : list[str] | None
+            Intestazioni personalizzate (possono contenere LaTeX; non vengono escapate).
+        raw_columns : set[str] | None
+            Colonne già formattate in LaTeX (es. p-value o IC) da non escapare.
+        float_decimals : int
+            Numero di decimali per colonne float non raw.
+        fit_width : bool
+            Se True, racchiude la tabella in `\\resizebox{\\textwidth}{!}{...}` per
+            evitare Overfull \\hbox su tabelle con molte colonne.
         """
         if not filename.endswith(".tex"):
             filename = f"{filename}.tex"
 
         cols = df.columns
-        align = col_align or ("l" + "r" * (len(cols) - 1))
+        align = col_align or ("l" + "r" * max(len(cols) - 1, 0))
         col_headers = headers if headers is not None else [escape_latex(c) for c in cols]
         raw_cols = raw_columns or set()
 
-        lines = [
-            f"% AUTO-GENERATED BY OhnomiTools ({filename})",
-            f"\\begin{{tabular}}{{{align}}}",
-            "\\toprule",
-            " & ".join(f"\\textbf{{{h}}}" for h in col_headers) + r" \\",
-            "\\midrule",
-        ]
+        lines = [f"% AUTO-GENERATED BY OhnomiTools ({filename})"]
+        if fit_width:
+            lines.append(r"\resizebox{\textwidth}{!}{%")
+
+        lines.extend(
+            [
+                f"\\begin{{tabular}}{{{align}}}",
+                "\\toprule",
+                " & ".join(f"\\textbf{{{h}}}" for h in col_headers) + r" \\",
+                "\\midrule",
+            ]
+        )
 
         for row in df.iter_rows(named=True):
             formatted_cells: list[str] = []
@@ -164,15 +265,16 @@ class LatexExporter:
                 elif isinstance(v, int):
                     formatted_cells.append(format_int(v))
                 elif isinstance(v, float):
-                    formatted_cells.append(
-                        "--" if math.isnan(v) else format_float(v, float_decimals)
-                    )
+                    formatted_cells.append(format_float(v, float_decimals))
                 else:
                     formatted_cells.append(escape_latex(str(v)))
             lines.append(" & ".join(formatted_cells) + r" \\")
 
         lines.extend(["\\bottomrule", "\\end{tabular}"])
+        if fit_width:
+            lines.append("}")
+
         target = self.out_dir / filename
         self._atomic_write_text("\n".join(lines) + "\n", target)
-        logger.info(f"Esportata tabella LaTeX: {target.name} ({len(df)} righe)")
+        logger.info("Esportata tabella LaTeX: %s (%d righe)", target.name, len(df))
         return target
