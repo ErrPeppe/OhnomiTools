@@ -9,6 +9,7 @@ from scipy.stats import ks_2samp, mannwhitneyu
 
 from .config import PATHS, ProjectPaths
 from .stats import (
+    bootstrap_mean_ci,
     compute_zscore,
     evaluate_pair_motifs_numba,
     evaluate_single_node_ppi_delta_numba,
@@ -17,6 +18,26 @@ from .stats import (
 )
 
 logger = logging.getLogger("OhnomiTools.network")
+
+
+def _compute_pair_z_array(
+    obs: np.ndarray,
+    null_mean: np.ndarray,
+    null_m2: np.ndarray,
+    n_null: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Z-score per coppia con gestione esatta di sigma_null == 0 (Agasso et al., 2025):
+    NaN se sigma_null == 0 e obs != mean; 0.0 solo se sigma_null == 0 e obs == mean.
+    """
+    std = np.sqrt(np.clip(null_m2 / max(1, n_null - 1), 0.0, None))
+    z = np.full(len(obs), np.nan, dtype=np.float64)
+    has_var = std > 1e-12
+    zero_both = (~has_var) & (np.abs(obs - null_mean) <= 1e-12)
+    z[has_var] = (obs[has_var] - null_mean[has_var]) / std[has_var]
+    z[zero_both] = 0.0
+    undefined_mask = (~has_var) & (~zero_both)
+    return z, undefined_mask
 
 
 @dataclass
@@ -41,11 +62,7 @@ class BipartiteNetwork:
 
 
 class NetworkMotifAnalyzer:
-    """
-    Fase 3: Analisi topologica, ridondanza regolatoria (Sørensen-Dice, Jaccard, ΔDegree),
-    motivi di rete (V-motifs, Bifans, Duplicated Bifans, PPI-Bifans, PPI-Delta) e modelli
-    nulli di Maslov-Sneppen su Layer RBP (+ STRING PPI) e Layer miRNA per tutte e 3 le Vie.
-    """
+    """Fase 3: gradi k_out, ridondanza, 4 famiglie di motivi e modelli nulli Maslov-Sneppen."""
 
     def __init__(self, paths: ProjectPaths = PATHS) -> None:
         self.paths = paths
@@ -102,7 +119,6 @@ class NetworkMotifAnalyzer:
             if "gene_id" in cols and "mirna_id" in cols:
                 gene_col, mir_col = "gene_id", "mirna_id"
             else:
-                # Fallback sicuro basato sui valori reali (mai sui nomi colonna)
                 gene_col = next(
                     (c for c in cols if df_head[c].cast(pl.Utf8).str.starts_with("HSALNG").any()),
                     cols[0],
@@ -115,7 +131,7 @@ class NetworkMotifAnalyzer:
                     cols[-1],
                 )
 
-            df = (
+            return (
                 pl.scan_parquet(pq_path)
                 .select([
                     pl.col(gene_col).cast(pl.Utf8).str.strip_chars().alias("lncrna_id"),
@@ -132,7 +148,6 @@ class NetworkMotifAnalyzer:
                 .agg(pl.len().alias("n_sites"))
                 .collect()
             )
-            return df
 
         raise ValueError(f"Layer non riconosciuto: '{layer}'. Usa 'rbp' oppure 'mirna'.")
 
@@ -153,6 +168,7 @@ class NetworkMotifAnalyzer:
         v_names = sorted(df_edges["target_id"].unique().to_list())
         u_to_idx = {name: i for i, name in enumerate(u_names)}
         v_to_idx = {name: i for i, name in enumerate(v_names)}
+        v_to_idx_upper = {name.upper(): i for i, name in enumerate(v_names)}
 
         u_map_df = pl.DataFrame({"lncrna_id": u_names, "u_idx": np.arange(len(u_names), dtype=np.int32)})
         v_map_df = pl.DataFrame({"target_id": v_names, "v_idx": np.arange(len(v_names), dtype=np.int32)})
@@ -191,7 +207,11 @@ class NetworkMotifAnalyzer:
                 )
                 for p1, p2 in df_ppi.iter_rows():
                     i1 = v_to_idx.get(p1)
+                    if i1 is None and p1:
+                        i1 = v_to_idx_upper.get(p1.upper())
                     i2 = v_to_idx.get(p2)
+                    if i2 is None and p2:
+                        i2 = v_to_idx_upper.get(p2.upper())
                     if i1 is not None and i2 is not None and i1 != i2 and ppi_mat[i1, i2] == 0:
                         ppi_mat[i1, i2] = 1
                         ppi_mat[i2, i1] = 1
@@ -204,7 +224,11 @@ class NetworkMotifAnalyzer:
                     df_d = pl.read_parquet(dup_pq).select(["gene_name_1", "gene_name_2"]).drop_nulls()
                     for g1, g2 in df_d.iter_rows():
                         i1 = v_to_idx.get(g1)
+                        if i1 is None and g1:
+                            i1 = v_to_idx_upper.get(g1.upper())
                         i2 = v_to_idx.get(g2)
+                        if i2 is None and g2:
+                            i2 = v_to_idx_upper.get(g2.upper())
                         if i1 is not None and i2 is not None and i1 != i2 and dup_mat[i1, i2] == 0:
                             dup_mat[i1, i2] = 1
                             dup_mat[i2, i1] = 1
@@ -213,8 +237,8 @@ class NetworkMotifAnalyzer:
 
         logger.info(
             f"Rete [{layer.upper()}] costruita: {n_u:,} lncRNA | {n_v:,} target | "
-            f"{len(edge_u):,} archi unici | PPI STRING mappati (>={ppi_min_score}): {n_ppi_mapped:,} | "
-            f"Coppie target paraloghi: {n_dup_mapped:,}"
+            f"{len(edge_u):,} archi unici | PPI STRING (>={ppi_min_score}): {n_ppi_mapped:,} | "
+            f"Target paraloghi: {n_dup_mapped:,}"
         )
 
         return BipartiteNetwork(
@@ -252,7 +276,7 @@ class NetworkMotifAnalyzer:
             pq = self.paths.silver_lane2_wgd_pairs if dup_type == "WGD" else self.paths.silver_lane2_ssd_pairs
             df = pl.read_parquet(pq)
         else:
-            raise ValueError(f"Lane non valida per analisi a coppie: '{lane}' (usa 'via1' o 'via2').")
+            raise ValueError(f"Lane non valida: '{lane}' (usa 'via1' o 'via2').")
 
         if strict_1to1_only and "is_strict_1to1_host" in df.columns:
             df = df.filter(pl.col("is_strict_1to1_host") == True)
@@ -263,6 +287,7 @@ class NetworkMotifAnalyzer:
         return df
 
     def analyze_degree_distributions(self, net: BipartiteNetwork) -> dict[str, pl.DataFrame]:
+        """Distribuzioni k_out sulle 3 Vie con disgiunzione stretta WGD vs SSD."""
         df_deg = pl.DataFrame({
             "lncrna_id": net.u_names,
             "k_out": net.degrees_u.astype(np.int64),
@@ -272,9 +297,17 @@ class NetworkMotifAnalyzer:
             return set(df_p["lncrna_1"].to_list()) | set(df_p["lncrna_2"].to_list())
 
         wgd1_ids = _extract_ids(self._load_lane_pairs("via1", "WGD"))
-        ssd1_ids = _extract_ids(self._load_lane_pairs("via1", "SSD"))
+        ssd1_raw = _extract_ids(self._load_lane_pairs("via1", "SSD"))
+        ssd1_ids = ssd1_raw - wgd1_ids
+
         wgd2_ids = _extract_ids(self._load_lane_pairs("via2", "WGD"))
-        ssd2_ids = _extract_ids(self._load_lane_pairs("via2", "SSD"))
+        ssd2_raw = _extract_ids(self._load_lane_pairs("via2", "SSD"))
+        ssd2_ids = ssd2_raw - wgd2_ids
+
+        logger.info(
+            f"[{net.layer_name.upper()}] Disgiunzione WGD/SSD: rimossi {len(ssd1_raw) - len(ssd1_ids):,} "
+            f"geni sovrapposti da SSD Via 1 e {len(ssd2_raw) - len(ssd2_ids):,} da SSD Via 2."
+        )
 
         df_via3 = pl.read_parquet(self.paths.silver_lane3_euteleostomi)
         df_phylo = pl.read_parquet(self.paths.silver_phylostratigraphy)
@@ -359,16 +392,21 @@ class NetworkMotifAnalyzer:
         self,
         net: BipartiteNetwork,
         lane: str = "via2",
-        n_null: int = 100,
-        burn_in_factor: int = 6,
-        step_factor: int = 2,
+        n_null: int = 1000,
+        burn_in_factor: int = 10,
+        step_factor: int = 10,
         seed: int = 42,
         strict_1to1_only: bool = False,
         max_ssd_pairs_for_null: int | None = None,
+        independent_replicas: bool = False,
+        save_outputs: bool = True,
+        output_tag: str | None = None,
     ) -> dict[str, pl.DataFrame | dict]:
+        """Analisi motivi a coppie e modello nullo Maslov-Sneppen (4 famiglie di Bifans)."""
         results_rows: list[dict] = []
         pair_tables: dict[str, pl.DataFrame] = {}
         null_dists: dict[str, dict[str, np.ndarray]] = {}
+        undefined_z_pairs: dict[str, pl.DataFrame] = {}
 
         for dup_type in ("WGD", "SSD"):
             df_raw = self._load_lane_pairs(lane, dup_type, strict_1to1_only=strict_1to1_only)
@@ -400,10 +438,10 @@ class NetworkMotifAnalyzer:
             n_in_net = len(pair_u)
 
             if n_in_net == 0:
-                logger.warning(f"[{net.layer_name.upper()} | {lane} | {dup_type}] Nessuna coppia con entrambi i nodi in rete.")
+                logger.warning(f"[{net.layer_name.upper()} | {lane} | {dup_type}] Nessuna coppia in rete.")
                 continue
 
-            obs_v, obs_dice, obs_jacc, obs_sb, obs_db, obs_pb = evaluate_pair_motifs_numba(
+            obs_v, obs_dice, obs_jacc, obs_gk, obs_db, obs_pcb, obs_pdb = evaluate_pair_motifs_numba(
                 net.offsets, net.edge_v, len(net.v_names),
                 pair_u, pair_w, net.ppi_mat, net.dup_mat, net.use_ppi, net.use_dup
             )
@@ -415,37 +453,36 @@ class NetworkMotifAnalyzer:
 
             track_pp = n_in_net <= 25000
             (
-                null_v, null_dice, null_sb, null_db, null_pb,
-                pv_sum, pv_sq, ppb_sum, ppb_sq,
+                null_v, null_dice, null_gk, null_db, null_pcb, null_pdb,
+                pv_mean, pv_m2, ppcb_mean, ppcb_m2, ppdb_mean, ppdb_m2,
             ) = run_null_ensemble_pairs_numba(
                 net.edge_u, net.edge_v, net.offsets, len(net.v_names),
                 pair_u, pair_w, net.ppi_mat, net.dup_mat, net.use_ppi, net.use_dup,
                 n_null, burn_in_factor, step_factor,
                 seed + (0 if dup_type == "WGD" else 1000),
                 track_pp,
+                independent_replicas,
             )
 
             null_dists[dup_type] = {
                 "v_motifs": null_v,
                 "mean_dice": null_dice,
-                "simple_bifans": null_sb,
-                "dup_bifans": null_db,
-                "ppi_bifans": null_pb,
+                "generic_k22_bifans": null_gk,
+                "dup_target_bifans": null_db,
+                "ppi_complex_bifans": null_pcb,
+                "ppi_dup_bifans": null_pdb,
             }
 
             if track_pp:
-                pv_mean = pv_sum / n_null
-                pv_std = np.sqrt(np.clip((pv_sq - n_null * pv_mean * pv_mean) / max(1, n_null - 1), 0.0, None))
-                pair_v_z = np.zeros(n_in_net, dtype=np.float64)
-                np.divide(obs_v - pv_mean, pv_std, out=pair_v_z, where=pv_std > 1e-12)
-
-                ppb_mean = ppb_sum / n_null
-                ppb_std = np.sqrt(np.clip((ppb_sq - n_null * ppb_mean * ppb_mean) / max(1, n_null - 1), 0.0, None))
-                pair_pb_z = np.zeros(n_in_net, dtype=np.float64)
-                np.divide(obs_pb - ppb_mean, ppb_std, out=pair_pb_z, where=ppb_std > 1e-12)
+                pair_v_z, undef_v = _compute_pair_z_array(obs_v.astype(np.float64), pv_mean, pv_m2, n_null)
+                pair_pcb_z, undef_pcb = _compute_pair_z_array(obs_pcb.astype(np.float64), ppcb_mean, ppcb_m2, n_null)
+                pair_pdb_z, undef_pdb = _compute_pair_z_array(obs_pdb.astype(np.float64), ppdb_mean, ppdb_m2, n_null)
+                any_undef = undef_v | (undef_pcb if net.use_ppi else False) | (undef_pdb if (net.use_ppi and net.use_dup) else False)
             else:
                 pair_v_z = np.full(n_in_net, np.nan)
-                pair_pb_z = np.full(n_in_net, np.nan)
+                pair_pcb_z = np.full(n_in_net, np.nan)
+                pair_pdb_z = np.full(n_in_net, np.nan)
+                any_undef = np.zeros(n_in_net, dtype=bool)
 
             keep_cols = [
                 c for c in [
@@ -462,25 +499,34 @@ class NetworkMotifAnalyzer:
                 pl.Series("v_motifs", obs_v),
                 pl.Series("sorensen_dice", np.round(obs_dice, 5)),
                 pl.Series("jaccard", np.round(obs_jacc, 5)),
-                pl.Series("simple_bifans", obs_sb),
-                pl.Series("dup_bifans", obs_db),
-                pl.Series("ppi_bifans", obs_pb),
+                pl.Series("generic_k22_bifans", obs_gk),
+                pl.Series("dup_target_bifans", obs_db),
+                pl.Series("ppi_complex_bifans", obs_pcb),
+                pl.Series("ppi_dup_bifans", obs_pdb),
                 pl.Series("v_motif_pair_z", np.round(pair_v_z, 3)),
-                pl.Series("ppi_bifan_pair_z", np.round(pair_pb_z, 3)),
+                pl.Series("ppi_complex_bifan_pair_z", np.round(pair_pcb_z, 3)),
+                pl.Series("ppi_dup_bifan_pair_z", np.round(pair_pdb_z, 3)),
             ])
             pair_tables[dup_type] = df_pairs_out
 
+            df_undef = df_pairs_out.filter(pl.Series(any_undef))
+            undefined_z_pairs[dup_type] = df_undef
+            if len(df_undef) > 0:
+                logger.info(
+                    f"[{net.layer_name.upper()} | {lane} | {dup_type}] "
+                    f"{len(df_undef)} coppie con sigma_null=0 e obs>0 impostate a NaN."
+                )
+
             metric_specs = [
-                ("V-Motifs (totale)", float(obs_v.sum()), null_v),
-                ("Mean Sørensen-Dice", float(obs_dice.mean()), null_dice),
-                ("Simple Bifans (totale)", float(obs_sb.sum()), null_sb),
-                ("Duplicated Bifans", float(obs_db.sum()), null_db),
-                ("PPI-Bifans (STRING)", float(obs_pb.sum()), null_pb),
+                ("V-Motifs (totale)", float(obs_v.sum()), null_v, True),
+                ("Mean Sørensen-Dice", float(obs_dice.mean()), null_dice, True),
+                ("Generic K2,2 Bifans", float(obs_gk.sum()), null_gk, True),
+                ("Duplicated-Target Bifans", float(obs_db.sum()), null_db, net.use_dup),
+                ("PPI-Complex Bifans (STRING)", float(obs_pcb.sum()), null_pcb, net.use_ppi),
+                ("PPI-Dup Bifans (STRING+Paralog)", float(obs_pdb.sum()), null_pdb, net.use_ppi and net.use_dup),
             ]
-            for m_name, obs_val, n_arr in metric_specs:
-                if m_name == "PPI-Bifans (STRING)" and not net.use_ppi:
-                    continue
-                if m_name == "Duplicated Bifans" and not net.use_dup:
+            for m_name, obs_val, n_arr, active in metric_specs:
+                if not active:
                     continue
                 n_mean, n_std, z_val, p_emp = compute_zscore(obs_val, n_arr)
                 results_rows.append({
@@ -490,24 +536,42 @@ class NetworkMotifAnalyzer:
                     "Coppie_totali": n_total_pairs,
                     "Coppie_in_rete": n_in_net,
                     "Frac_V_pos_pct": round(100.0 * float(np.mean(obs_v > 0)), 2),
-                    "Frac_PPI_Bifan_pos_pct": round(100.0 * float(np.mean(obs_pb > 0)), 2) if net.use_ppi else 0.0,
+                    "Frac_PPI_Complex_pos_pct": round(100.0 * float(np.mean(obs_pcb > 0)), 2) if net.use_ppi else 0.0,
+                    "Frac_PPI_Dup_pos_pct": round(100.0 * float(np.mean(obs_pdb > 0)), 2) if (net.use_ppi and net.use_dup) else 0.0,
                     "Metrica": m_name,
                     "Osservato": round(obs_val, 5),
                     "Null_Mean": round(n_mean, 5),
                     "Null_Std": round(n_std, 5),
-                    "Z_score": round(z_val, 2),
+                    "Z_score": round(z_val, 2) if np.isfinite(z_val) else float("nan"),
                     "p_empirico": round(p_emp, 5),
                 })
 
         df_z_summary = pl.DataFrame(results_rows)
         suffix = f"{net.layer_name}_{lane}" + ("_1to1" if strict_1to1_only else "")
-        df_z_summary.write_csv(self.paths.gold / f"phase3_{suffix}_null_zscores.csv")
+        if output_tag:
+            suffix = f"{suffix}_{output_tag}"
+
+        if save_outputs:
+            df_z_summary.write_csv(self.paths.gold / f"phase3_{suffix}_null_zscores.csv")
+            for dt, df_u in undefined_z_pairs.items():
+                if len(df_u) > 0:
+                    df_u.write_csv(self.paths.gold / f"phase3_{suffix}_{dt}_undefined_sigma0_pairs.csv")
 
         comp_rows = []
         if "WGD" in pair_tables and "SSD" in pair_tables:
             tw, ts = pair_tables["WGD"], pair_tables["SSD"]
-            for col in ["sorensen_dice", "jaccard", "v_motifs", "simple_bifans", "norm_delta_k", "ppi_bifans"]:
-                if col == "ppi_bifans" and not net.use_ppi:
+            metric_cols = [
+                ("sorensen_dice", True),
+                ("jaccard", True),
+                ("v_motifs", True),
+                ("generic_k22_bifans", True),
+                ("norm_delta_k", True),
+                ("dup_target_bifans", net.use_dup),
+                ("ppi_complex_bifans", net.use_ppi),
+                ("ppi_dup_bifans", net.use_ppi and net.use_dup),
+            ]
+            for col, active in metric_cols:
+                if not active:
                     continue
                 aw = tw[col].to_numpy().astype(np.float64)
                 as_ = ts[col].to_numpy().astype(np.float64)
@@ -528,10 +592,11 @@ class NetworkMotifAnalyzer:
                     "MW_p": float(mw_p),
                 })
 
-            self.paths.save_parquet_safe(tw, self.paths.silver / f"phase3_{suffix}_wgd_pair_metrics.parquet")
+            if save_outputs:
+                self.paths.save_parquet_safe(tw, self.paths.silver / f"phase3_{suffix}_wgd_pair_metrics.parquet")
 
         df_comp = pl.DataFrame(comp_rows)
-        if not df_comp.is_empty():
+        if save_outputs and not df_comp.is_empty():
             df_comp.write_csv(self.paths.gold / f"phase3_{suffix}_wgd_vs_ssd_divergence.csv")
 
         return {
@@ -539,16 +604,76 @@ class NetworkMotifAnalyzer:
             "wgd_vs_ssd": df_comp,
             "pair_tables": pair_tables,
             "null_dists": null_dists,
+            "undefined_z_pairs": undefined_z_pairs,
         }
+
+    def compare_host_aggregated_pair_metrics(
+        self,
+        pair_tables: dict[str, pl.DataFrame],
+        layer_name: str,
+        lane: str,
+        agg: str = "median",
+    ) -> pl.DataFrame:
+        """
+        Controllo anti-pseudoreplicazione: aggrega le metriche di rete a 1 osservazione
+        per singola `pair_key` di geni host prima del confronto WGD vs SSD (KS + MW).
+        """
+        if "WGD" not in pair_tables or "SSD" not in pair_tables:
+            return pl.DataFrame()
+        if agg not in {"median", "mean"}:
+            raise ValueError("`agg` deve essere 'median' oppure 'mean'.")
+
+        candidate_cols = [
+            "sorensen_dice", "jaccard", "v_motifs",
+            "generic_k22_bifans", "norm_delta_k",
+            "ppi_complex_bifans", "ppi_dup_bifans",
+        ]
+        tw_raw, ts_raw = pair_tables["WGD"], pair_tables["SSD"]
+        cols = [c for c in candidate_cols if c in tw_raw.columns and c in ts_raw.columns]
+        agg_exprs = [
+            (pl.col(c).median() if agg == "median" else pl.col(c).mean()).alias(c)
+            for c in cols
+        ]
+        tw = tw_raw.group_by("pair_key").agg(agg_exprs)
+        ts = ts_raw.group_by("pair_key").agg(agg_exprs)
+
+        rows = []
+        for col in cols:
+            aw = tw[col].drop_nulls().to_numpy().astype(np.float64)
+            as_ = ts[col].drop_nulls().to_numpy().astype(np.float64)
+            if len(aw) < 3 or len(as_) < 3:
+                continue
+            ks_s, ks_p = ks_2samp(aw, as_)
+            _, mw_p = mannwhitneyu(aw, as_, alternative="two-sided")
+            rows.append({
+                "Layer": layer_name.upper(),
+                "Via": lane,
+                "Aggregazione": f"host_pair_{agg}",
+                "Metrica": col,
+                "WGD_hosts_n": len(aw),
+                "WGD_media": round(float(np.mean(aw)), 5),
+                "WGD_mediana": round(float(np.median(aw)), 5),
+                "SSD_hosts_n": len(as_),
+                "SSD_media": round(float(np.mean(as_)), 5),
+                "SSD_mediana": round(float(np.median(as_)), 5),
+                "KS_stat": round(float(ks_s), 4),
+                "KS_p": float(ks_p),
+                "MW_p": float(mw_p),
+            })
+        return pl.DataFrame(rows)
 
     def analyze_via3_ppi_delta(
         self,
         net: BipartiteNetwork,
-        n_null: int = 100,
-        burn_in_factor: int = 6,
-        step_factor: int = 2,
+        n_null: int = 1000,
+        burn_in_factor: int = 10,
+        step_factor: int = 10,
         seed: int = 123,
+        independent_replicas: bool = False,
+        save_outputs: bool = True,
+        output_tag: str | None = None,
     ) -> pl.DataFrame:
+        """Calcola PPI-Complex Delta (STRING) e PPI-Dup Delta (STRING+Paralog) su Via 3."""
         if not net.use_ppi:
             raise ValueError("PPI-Delta richiede un layer proteico con matrice STRING PPI attiva.")
 
@@ -572,28 +697,41 @@ class NetworkMotifAnalyzer:
             if len(node_idxs) == 0:
                 continue
 
-            obs_counts = evaluate_single_node_ppi_delta_numba(net.offsets, net.edge_v, node_idxs, net.ppi_mat)
-            obs_tot = float(obs_counts.sum())
-            null_arr = run_null_ensemble_ppi_delta_numba(
-                net.edge_u, net.edge_v, net.offsets, node_idxs, net.ppi_mat,
-                n_null, burn_in_factor, step_factor, seed + idx_c * 17
+            obs_c, obs_d = evaluate_single_node_ppi_delta_numba(
+                net.offsets, net.edge_v, node_idxs, net.ppi_mat, net.dup_mat, net.use_dup
             )
-            n_mean, n_std, z_val, p_emp = compute_zscore(obs_tot, null_arr)
-            rows.append({
-                "Layer": net.layer_name.upper(),
-                "Coorte_Via3": label,
-                "N_in_rete": len(node_idxs),
-                "Frac_PPI_Delta_pos_pct": round(100.0 * float(np.mean(obs_counts > 0)), 2),
-                "Media_PPI_Delta_per_gene": round(float(obs_counts.mean()), 3),
-                "Totale_osservato": int(obs_tot),
-                "Null_Mean": round(n_mean, 2),
-                "Null_Std": round(n_std, 2),
-                "Z_score": round(z_val, 2),
-                "p_empirico": round(p_emp, 5),
-            })
+            null_c, null_d = run_null_ensemble_ppi_delta_numba(
+                net.edge_u, net.edge_v, net.offsets, node_idxs,
+                net.ppi_mat, net.dup_mat, net.use_dup,
+                n_null, burn_in_factor, step_factor, seed + idx_c * 17,
+                independent_replicas,
+            )
+
+            specs = [("ppi_complex_delta", obs_c, null_c)]
+            if net.use_dup:
+                specs.append(("ppi_dup_delta", obs_d, null_d))
+
+            for m_type, obs_arr, null_arr in specs:
+                obs_tot = float(obs_arr.sum())
+                n_mean, n_std, z_val, p_emp = compute_zscore(obs_tot, null_arr)
+                rows.append({
+                    "Layer": net.layer_name.upper(),
+                    "Tipo_Motivo": m_type,
+                    "Coorte_Via3": label,
+                    "N_in_rete": len(node_idxs),
+                    "Frac_PPI_Delta_pos_pct": round(100.0 * float(np.mean(obs_arr > 0)), 2),
+                    "Media_PPI_Delta_per_gene": round(float(obs_arr.mean()), 3),
+                    "Totale_osservato": int(obs_tot),
+                    "Null_Mean": round(n_mean, 2),
+                    "Null_Std": round(n_std, 2),
+                    "Z_score": round(z_val, 2) if np.isfinite(z_val) else float("nan"),
+                    "p_empirico": round(p_emp, 5),
+                })
 
         df_out = pl.DataFrame(rows)
-        df_out.write_csv(self.paths.gold / f"phase3_{net.layer_name}_via3_ppi_delta.csv")
+        if save_outputs:
+            suffix = f"_{output_tag}" if output_tag else ""
+            df_out.write_csv(self.paths.gold / f"phase3_{net.layer_name}_via3_ppi_delta{suffix}.csv")
         return df_out
 
     def plot_phase3_comparison(
@@ -601,53 +739,62 @@ class NetworkMotifAnalyzer:
         net: BipartiteNetwork,
         res_via1: dict,
         res_via2: dict,
+        n_boot: int = 10_000,
+        boot_seed: int = 42,
         save_fig: bool = True,
     ) -> tuple[Path | None, Path | None]:
+        """Figura riassuntiva Fase 3 con CI bootstrap non parametrici (B=10,000) su S_SD."""
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2), dpi=140)
         fig.patch.set_facecolor("white")
 
-        # --- Pannello A: Sørensen-Dice medio WGD vs SSD (Via 1 e Via 2) ---
+        # --- Pannello A: Sørensen-Dice medio WGD vs SSD (CI bootstrap 95%) ---
         ax = axes[0]
         labels_a = ["Via 1 (Ramo A)\nWGD", "Via 1 (Ramo A)\nSSD ant.", "Via 2 (A ∩ B)\nWGD", "Via 2 (A ∩ B)\nSSD ant."]
-        vals_a = []
-        errs_a = []
-        counts_a = []
+        vals_a, err_lo_a, err_hi_a, counts_a = [], [], [], []
         colors_a = ["#D62728", "#1F77B4", "#B2182B", "#4393C3"]
+        b_idx = 0
         for res in (res_via1, res_via2):
             for dt in ("WGD", "SSD"):
-                if dt in res["pair_tables"]:
+                if dt in res["pair_tables"] and len(res["pair_tables"][dt]) > 0:
                     arr = res["pair_tables"][dt]["sorensen_dice"].to_numpy()
-                    vals_a.append(float(np.mean(arr)))
-                    errs_a.append(float(1.96 * np.std(arr) / np.sqrt(max(1, len(arr)))))
+                    m_val, ci_lo, ci_hi = bootstrap_mean_ci(arr, n_boot=n_boot, seed=boot_seed + b_idx)
+                    vals_a.append(m_val)
+                    err_lo_a.append(max(0.0, m_val - ci_lo))
+                    err_hi_a.append(max(0.0, ci_hi - m_val))
                     counts_a.append(len(arr))
                 else:
                     vals_a.append(0.0)
-                    errs_a.append(0.0)
+                    err_lo_a.append(0.0)
+                    err_hi_a.append(0.0)
                     counts_a.append(0)
+                b_idx += 1
 
         x_a = np.arange(len(labels_a))
-        ax.bar(x_a, vals_a, yerr=errs_a, capsize=4, color=colors_a, alpha=0.88, edgecolor="black", linewidth=0.7)
+        yerr_a = np.vstack([err_lo_a, err_hi_a])
+        ax.bar(x_a, vals_a, yerr=yerr_a, capsize=4, color=colors_a, alpha=0.88, edgecolor="black", linewidth=0.7)
         x_labels_n = [f"{lbl}\n(n={n})" for lbl, n in zip(labels_a, counts_a)]
         ax.set_xticks(x_a)
         ax.set_xticklabels(x_labels_n, fontsize=8.3)
-        ax.set_ylabel("Indice di Sørensen–Dice medio (± CI 95%)", fontsize=9.5)
+        ax.set_ylim(bottom=0.0)
+        ax.set_ylabel("Indice di Sørensen–Dice medio (CI 95% bootstrap)", fontsize=9.5)
         ax.set_title(f"A) Ridondanza Target — Layer {net.layer_name.upper()}\n(WGD vs SSD Antiche)", fontsize=10.2, fontweight="bold")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
 
         # --- Pannello B: Z-score Maslov-Sneppen su Via 2 (A ∩ B) ---
         ax = axes[1]
         df_z2: pl.DataFrame = res_via2["z_summary"]
-        metrics_order = df_z2["Metrica"].unique(maintain_order=True).to_list()
+        metrics_order = df_z2["Metrica"].unique(maintain_order=True).to_list() if not df_z2.is_empty() else []
         y_b = np.arange(len(metrics_order))
-        z_wgd = []
-        z_ssd = []
+        z_wgd, z_ssd = [], []
         for m in metrics_order:
             w_row = df_z2.filter((pl.col("Metrica") == m) & (pl.col("Tipo") == "WGD"))
             s_row = df_z2.filter((pl.col("Metrica") == m) & (pl.col("Tipo") == "SSD"))
-            z_wgd.append(float(w_row["Z_score"][0]) if len(w_row) else 0.0)
-            z_ssd.append(float(s_row["Z_score"][0]) if len(s_row) else 0.0)
+            vw = float(w_row["Z_score"][0]) if len(w_row) else float("nan")
+            vs = float(s_row["Z_score"][0]) if len(s_row) else float("nan")
+            z_wgd.append(vw if np.isfinite(vw) else 0.0)
+            z_ssd.append(vs if np.isfinite(vs) else 0.0)
 
         h = 0.35
         ax.barh(y_b - h / 2, z_wgd, height=h, color="#D62728", alpha=0.9, label="WGD (Via 2: A ∩ B)")
@@ -656,25 +803,25 @@ class NetworkMotifAnalyzer:
         ax.axvline(-5.0, color="black", linestyle="--", linewidth=1.0)
         ax.axvline(0.0, color="gray", linestyle="-", linewidth=0.8)
         ax.set_yticks(y_b)
-        ax.set_yticklabels(metrics_order, fontsize=8.8)
+        ax.set_yticklabels(metrics_order, fontsize=8.5)
         ax.invert_yaxis()
         ax.set_xlabel("Z-score (Modello Nullo di Maslov–Sneppen)", fontsize=9.5)
         ax.set_title(f"B) Arricchimento Motivi (Via 2: A ∩ B)\nLayer {net.layer_name.upper()}", fontsize=10.2, fontweight="bold")
         ax.grid(True, axis="x", linestyle=":", alpha=0.5)
         ax.legend(fontsize=8, loc="best")
 
-        # --- Pannello C: Scatter Topologico Via 2 WGD (Sørensen-Dice vs ΔDegree norm.) ---
+        # --- Pannello C: Scatter Topologico Via 2 WGD ---
         ax = axes[2]
         if "WGD" in res_via2["pair_tables"] and len(res_via2["pair_tables"]["WGD"]) > 0:
             tw2 = res_via2["pair_tables"]["WGD"]
             x_c = tw2["sorensen_dice"].to_numpy()
             y_c = tw2["norm_delta_k"].to_numpy()
-            c_val = tw2["ppi_bifans"].to_numpy() if net.use_ppi else tw2["v_motifs"].to_numpy()
+            c_val = tw2["ppi_complex_bifans"].to_numpy() if net.use_ppi else tw2["v_motifs"].to_numpy()
             sc = ax.scatter(
                 x_c, y_c, c=np.log1p(c_val), cmap="viridis",
                 s=34, alpha=0.82, edgecolors="k", linewidths=0.35
             )
-            cbar_lbl = "log(1 + PPI-Bifans)" if net.use_ppi else "log(1 + V-Motifs)"
+            cbar_lbl = "log(1 + PPI-Complex Bifans)" if net.use_ppi else "log(1 + V-Motifs)"
             fig.colorbar(sc, ax=ax, label=cbar_lbl)
         else:
             ax.text(
