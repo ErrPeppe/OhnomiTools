@@ -14,7 +14,7 @@ from .stats import (
     evaluate_pair_motifs_numba,
     evaluate_single_node_ppi_delta_numba,
     run_null_ensemble_pairs_numba,
-    run_null_ensemble_ppi_delta_numba,
+    run_null_ensemble_ppi_delta_multi_numba,
 )
 
 logger = logging.getLogger("OhnomiTools.network")
@@ -402,11 +402,8 @@ class NetworkMotifAnalyzer:
         save_outputs: bool = True,
         output_tag: str | None = None,
     ) -> dict[str, pl.DataFrame | dict]:
-        """Analisi motivi a coppie e modello nullo Maslov-Sneppen (4 famiglie di Bifans)."""
-        results_rows: list[dict] = []
-        pair_tables: dict[str, pl.DataFrame] = {}
-        null_dists: dict[str, dict[str, np.ndarray]] = {}
-        undefined_z_pairs: dict[str, pl.DataFrame] = {}
+        """Analisi motivi a coppie e modello nullo condiviso WGD + SSD (4 famiglie Bifans)."""
+        prepped: dict[str, tuple[pl.DataFrame, np.ndarray, np.ndarray, int]] = {}
 
         for dup_type in ("WGD", "SSD"):
             df_raw = self._load_lane_pairs(lane, dup_type, strict_1to1_only=strict_1to1_only)
@@ -435,49 +432,95 @@ class NetworkMotifAnalyzer:
 
             pair_u = np.array(u_idx_list, dtype=np.int32)
             pair_w = np.array(w_idx_list, dtype=np.int32)
-            n_in_net = len(pair_u)
-
-            if n_in_net == 0:
+            if len(pair_u) == 0:
                 logger.warning(f"[{net.layer_name.upper()} | {lane} | {dup_type}] Nessuna coppia in rete.")
+            prepped[dup_type] = (df_in, pair_u, pair_w, n_total_pairs)
+
+        wgd_u, wgd_w = prepped["WGD"][1], prepped["WGD"][2]
+        ssd_u, ssd_w = prepped["SSD"][1], prepped["SSD"][2]
+        n_wgd = len(wgd_u)
+        n_ssd = len(ssd_u)
+
+        if n_wgd == 0 and n_ssd == 0:
+            return {
+                "z_summary": pl.DataFrame(),
+                "wgd_vs_ssd": pl.DataFrame(),
+                "pair_tables": {},
+                "null_dists": {},
+                "undefined_z_pairs": {},
+            }
+
+        all_u = np.concatenate([wgd_u, ssd_u]).astype(np.int32)
+        all_w = np.concatenate([wgd_w, ssd_w]).astype(np.int32)
+
+        obs_all = evaluate_pair_motifs_numba(
+            net.offsets, net.edge_v, len(net.v_names),
+            all_u, all_w, net.ppi_mat, net.dup_mat, net.use_ppi, net.use_dup
+        )
+
+        track_wgd = 0 < n_wgd <= 50_000
+        track_ssd = 0 < n_ssd <= 50_000
+        null_wgd, null_ssd, pair_mean, pair_m2 = run_null_ensemble_pairs_numba(
+            net.edge_u, net.edge_v, net.offsets, len(net.v_names),
+            all_u, all_w, n_wgd,
+            net.ppi_mat, net.dup_mat, net.use_ppi, net.use_dup,
+            n_null, burn_in_factor, step_factor, seed,
+            track_wgd, track_ssd, independent_replicas,
+        )
+
+        results_rows: list[dict] = []
+        pair_tables: dict[str, pl.DataFrame] = {}
+        null_dists: dict[str, dict[str, np.ndarray]] = {}
+        undefined_z_pairs: dict[str, pl.DataFrame] = {}
+
+        slices = [
+            ("WGD", 0, n_wgd, null_wgd, track_wgd),
+            ("SSD", n_wgd, n_wgd + n_ssd, null_ssd, track_ssd),
+        ]
+
+        for dup_type, s_idx, e_idx, null_mat, is_tracked in slices:
+            n_in_net = e_idx - s_idx
+            if n_in_net == 0:
                 continue
 
-            obs_v, obs_dice, obs_jacc, obs_gk, obs_db, obs_pcb, obs_pdb = evaluate_pair_motifs_numba(
-                net.offsets, net.edge_v, len(net.v_names),
-                pair_u, pair_w, net.ppi_mat, net.dup_mat, net.use_ppi, net.use_dup
-            )
+            df_in, pair_u, pair_w, n_total_pairs = prepped[dup_type]
+            obs_v = obs_all[0][s_idx:e_idx]
+            obs_dice = obs_all[1][s_idx:e_idx]
+            obs_jacc = obs_all[2][s_idx:e_idx]
+            obs_gk = obs_all[3][s_idx:e_idx]
+            obs_db = obs_all[4][s_idx:e_idx]
+            obs_pcb = obs_all[5][s_idx:e_idx]
+            obs_pdb = obs_all[6][s_idx:e_idx]
 
             deg1 = net.degrees_u[pair_u].astype(np.int64)
             deg2 = net.degrees_u[pair_w].astype(np.int64)
             delta_deg = np.abs(deg1 - deg2)
             norm_delta_deg = delta_deg / (deg1 + deg2)
 
-            track_pp = n_in_net <= 25000
-            (
-                null_v, null_dice, null_gk, null_db, null_pcb, null_pdb,
-                pv_mean, pv_m2, ppcb_mean, ppcb_m2, ppdb_mean, ppdb_m2,
-            ) = run_null_ensemble_pairs_numba(
-                net.edge_u, net.edge_v, net.offsets, len(net.v_names),
-                pair_u, pair_w, net.ppi_mat, net.dup_mat, net.use_ppi, net.use_dup,
-                n_null, burn_in_factor, step_factor,
-                seed + (0 if dup_type == "WGD" else 1000),
-                track_pp,
-                independent_replicas,
-            )
-
             null_dists[dup_type] = {
-                "v_motifs": null_v,
-                "mean_dice": null_dice,
-                "generic_k22_bifans": null_gk,
-                "dup_target_bifans": null_db,
-                "ppi_complex_bifans": null_pcb,
-                "ppi_dup_bifans": null_pdb,
+                "v_motifs": null_mat[0],
+                "mean_dice": null_mat[1],
+                "generic_k22_bifans": null_mat[2],
+                "dup_target_bifans": null_mat[3],
+                "ppi_complex_bifans": null_mat[4],
+                "ppi_dup_bifans": null_mat[5],
             }
 
-            if track_pp:
-                pair_v_z, undef_v = _compute_pair_z_array(obs_v.astype(np.float64), pv_mean, pv_m2, n_null)
-                pair_pcb_z, undef_pcb = _compute_pair_z_array(obs_pcb.astype(np.float64), ppcb_mean, ppcb_m2, n_null)
-                pair_pdb_z, undef_pdb = _compute_pair_z_array(obs_pdb.astype(np.float64), ppdb_mean, ppdb_m2, n_null)
-                any_undef = undef_v | (undef_pcb if net.use_ppi else False) | (undef_pdb if (net.use_ppi and net.use_dup) else False)
+            if is_tracked:
+                pair_v_z, undef_v = _compute_pair_z_array(
+                    obs_v.astype(np.float64), pair_mean[0, s_idx:e_idx], pair_m2[0, s_idx:e_idx], n_null
+                )
+                pair_pcb_z, undef_pcb = _compute_pair_z_array(
+                    obs_pcb.astype(np.float64), pair_mean[1, s_idx:e_idx], pair_m2[1, s_idx:e_idx], n_null
+                )
+                pair_pdb_z, undef_pdb = _compute_pair_z_array(
+                    obs_pdb.astype(np.float64), pair_mean[2, s_idx:e_idx], pair_m2[2, s_idx:e_idx], n_null
+                )
+                any_undef = (
+                    undef_v
+                    | (undef_pcb if net.use_ppi else False)
+                    | (undef_pdb if (net.use_ppi and net.use_dup) else False)
+                )
             else:
                 pair_v_z = np.full(n_in_net, np.nan)
                 pair_pcb_z = np.full(n_in_net, np.nan)
@@ -518,12 +561,12 @@ class NetworkMotifAnalyzer:
                 )
 
             metric_specs = [
-                ("V-Motifs (totale)", float(obs_v.sum()), null_v, True),
-                ("Mean Sørensen-Dice", float(obs_dice.mean()), null_dice, True),
-                ("Generic K2,2 Bifans", float(obs_gk.sum()), null_gk, True),
-                ("Duplicated-Target Bifans", float(obs_db.sum()), null_db, net.use_dup),
-                ("PPI-Complex Bifans (STRING)", float(obs_pcb.sum()), null_pcb, net.use_ppi),
-                ("PPI-Dup Bifans (STRING+Paralog)", float(obs_pdb.sum()), null_pdb, net.use_ppi and net.use_dup),
+                ("V-Motifs (totale)", float(obs_v.sum()), null_mat[0], True),
+                ("Mean Sørensen-Dice", float(obs_dice.mean()), null_mat[1], True),
+                ("Generic K2,2 Bifans", float(obs_gk.sum()), null_mat[2], True),
+                ("Duplicated-Target Bifans", float(obs_db.sum()), null_mat[3], net.use_dup),
+                ("PPI-Complex Bifans (STRING)", float(obs_pcb.sum()), null_mat[4], net.use_ppi),
+                ("PPI-Dup Bifans (STRING+Paralog)", float(obs_pdb.sum()), null_mat[5], net.use_ppi and net.use_dup),
             ]
             for m_name, obs_val, n_arr, active in metric_specs:
                 if not active:
@@ -614,10 +657,7 @@ class NetworkMotifAnalyzer:
         lane: str,
         agg: str = "median",
     ) -> pl.DataFrame:
-        """
-        Controllo anti-pseudoreplicazione: aggrega le metriche di rete a 1 osservazione
-        per singola `pair_key` di geni host prima del confronto WGD vs SSD (KS + MW).
-        """
+        """Controllo anti-pseudoreplicazione: 1 valore per singola pair_key di host."""
         if "WGD" not in pair_tables or "SSD" not in pair_tables:
             return pl.DataFrame()
         if agg not in {"median", "mean"}:
@@ -680,7 +720,7 @@ class NetworkMotifAnalyzer:
         df_via3 = pl.read_parquet(self.paths.silver_lane3_euteleostomi)
         df_phylo = pl.read_parquet(self.paths.silver_phylostratigraphy)
 
-        cohorts = [
+        cohorts_raw = [
             ("Eut_intragenic_WGD", df_via3.filter(pl.col("genomic_context") == "intragenic_WGD_host")["lncrna_gene_id"].to_list()),
             ("Eut_intragenic_other", df_via3.filter(pl.col("genomic_context") == "intragenic_other_host")["lncrna_gene_id"].to_list()),
             ("Eut_intergenic_lincRNA", df_via3.filter(pl.col("genomic_context") == "intergenic_lincRNA")["lncrna_gene_id"].to_list()),
@@ -688,28 +728,45 @@ class NetworkMotifAnalyzer:
             ("Control_1_Homo", df_phylo.filter(pl.col("age_node_num") == 1)["lncrna_gene_id"].to_list()),
         ]
 
-        rows = []
-        for idx_c, (label, id_list) in enumerate(cohorts):
-            node_idxs = np.array(
+        active_labels: list[str] = []
+        node_arrays: list[np.ndarray] = []
+        offsets_list = [0]
+        for label, id_list in cohorts_raw:
+            arr = np.array(
                 [net.u_to_idx[g] for g in set(id_list) if g in net.u_to_idx],
                 dtype=np.int32,
             )
-            if len(node_idxs) == 0:
-                continue
+            if len(arr) > 0:
+                active_labels.append(label)
+                node_arrays.append(arr)
+                offsets_list.append(offsets_list[-1] + len(arr))
 
-            obs_c, obs_d = evaluate_single_node_ppi_delta_numba(
-                net.offsets, net.edge_v, node_idxs, net.ppi_mat, net.dup_mat, net.use_dup
-            )
-            null_c, null_d = run_null_ensemble_ppi_delta_numba(
-                net.edge_u, net.edge_v, net.offsets, node_idxs,
-                net.ppi_mat, net.dup_mat, net.use_dup,
-                n_null, burn_in_factor, step_factor, seed + idx_c * 17,
-                independent_replicas,
-            )
+        if not node_arrays:
+            return pl.DataFrame()
 
-            specs = [("ppi_complex_delta", obs_c, null_c)]
+        all_nodes = np.concatenate(node_arrays).astype(np.int32)
+        cohort_offsets = np.array(offsets_list, dtype=np.int32)
+
+        obs_c_all, obs_d_all = evaluate_single_node_ppi_delta_numba(
+            net.offsets, net.edge_v, all_nodes, net.ppi_mat, net.dup_mat, net.use_dup
+        )
+        null_c_all, null_d_all = run_null_ensemble_ppi_delta_multi_numba(
+            net.edge_u, net.edge_v, net.offsets, len(net.v_names),
+            all_nodes, cohort_offsets,
+            net.ppi_mat, net.dup_mat, net.use_dup,
+            n_null, burn_in_factor, step_factor, seed, independent_replicas,
+        )
+
+        rows = []
+        for idx_c, label in enumerate(active_labels):
+            s = cohort_offsets[idx_c]
+            e = cohort_offsets[idx_c + 1]
+            obs_c = obs_c_all[s:e]
+            obs_d = obs_d_all[s:e]
+
+            specs = [("ppi_complex_delta", obs_c, null_c_all[idx_c])]
             if net.use_dup:
-                specs.append(("ppi_dup_delta", obs_d, null_d))
+                specs.append(("ppi_dup_delta", obs_d, null_d_all[idx_c]))
 
             for m_type, obs_arr, null_arr in specs:
                 obs_tot = float(obs_arr.sum())
@@ -718,7 +775,7 @@ class NetworkMotifAnalyzer:
                     "Layer": net.layer_name.upper(),
                     "Tipo_Motivo": m_type,
                     "Coorte_Via3": label,
-                    "N_in_rete": len(node_idxs),
+                    "N_in_rete": len(obs_arr),
                     "Frac_PPI_Delta_pos_pct": round(100.0 * float(np.mean(obs_arr > 0)), 2),
                     "Media_PPI_Delta_per_gene": round(float(obs_arr.mean()), 3),
                     "Totale_osservato": int(obs_tot),
@@ -749,7 +806,6 @@ class NetworkMotifAnalyzer:
         fig, axes = plt.subplots(1, 3, figsize=(17.5, 5.2), dpi=140)
         fig.patch.set_facecolor("white")
 
-        # --- Pannello A: Sørensen-Dice medio WGD vs SSD (CI bootstrap 95%) ---
         ax = axes[0]
         labels_a = ["Via 1 (Ramo A)\nWGD", "Via 1 (Ramo A)\nSSD ant.", "Via 2 (A ∩ B)\nWGD", "Via 2 (A ∩ B)\nSSD ant."]
         vals_a, err_lo_a, err_hi_a, counts_a = [], [], [], []
@@ -782,7 +838,6 @@ class NetworkMotifAnalyzer:
         ax.set_title(f"A) Ridondanza Target — Layer {net.layer_name.upper()}\n(WGD vs SSD Antiche)", fontsize=10.2, fontweight="bold")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
 
-        # --- Pannello B: Z-score Maslov-Sneppen su Via 2 (A ∩ B) ---
         ax = axes[1]
         df_z2: pl.DataFrame = res_via2["z_summary"]
         metrics_order = df_z2["Metrica"].unique(maintain_order=True).to_list() if not df_z2.is_empty() else []
@@ -810,7 +865,6 @@ class NetworkMotifAnalyzer:
         ax.grid(True, axis="x", linestyle=":", alpha=0.5)
         ax.legend(fontsize=8, loc="best")
 
-        # --- Pannello C: Scatter Topologico Via 2 WGD ---
         ax = axes[2]
         if "WGD" in res_via2["pair_tables"] and len(res_via2["pair_tables"]["WGD"]) > 0:
             tw2 = res_via2["pair_tables"]["WGD"]
