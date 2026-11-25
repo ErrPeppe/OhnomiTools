@@ -4,14 +4,14 @@ import numpy as np
 from numba import njit
 
 
-@njit(cache=True)
+@njit
 def _seed_numba(seed: int) -> None:
     np.random.seed(seed)
 
 
-@njit(cache=True)
+@njit
 def _bootstrap_means_numba(arr: np.ndarray, n_boot: int, seed: int) -> np.ndarray:
-    """Genera `n_boot` medie bootstrap non parametriche in O(n_boot * n) con memoria O(n_boot)."""
+    """Genera `n_boot` medie bootstrap non parametriche in O(n_boot * n)."""
     _seed_numba(seed)
     n = arr.shape[0]
     out = np.empty(n_boot, dtype=np.float64)
@@ -44,7 +44,7 @@ def bootstrap_mean_ci(
     return mean_val, float(lo), float(hi)
 
 
-@njit(cache=True)
+@njit
 def rewire_bipartite_maslov_sneppen(
     edge_u: np.ndarray,
     edge_v: np.ndarray,
@@ -96,7 +96,47 @@ def rewire_bipartite_maslov_sneppen(
     return accepted
 
 
-@njit(cache=True)
+@njit
+def rewire_bipartite_maslov_sneppen_dense(
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    adj: np.ndarray,
+    n_attempts: int,
+) -> int:
+    """Double-edge swap microcanonico O(1) per reti compatte (es. layer RBP)."""
+    n_edges = edge_u.shape[0]
+    if n_edges < 2:
+        return 0
+
+    accepted = 0
+    for _ in range(n_attempts):
+        e1 = np.random.randint(0, n_edges)
+        e2 = np.random.randint(0, n_edges)
+        u1 = edge_u[e1]
+        u2 = edge_u[e2]
+        if u1 == u2:
+            continue
+
+        v1 = edge_v[e1]
+        v2 = edge_v[e2]
+        if v1 == v2:
+            continue
+
+        if adj[u1, v2] != 0 or adj[u2, v1] != 0:
+            continue
+
+        adj[u1, v1] = 0
+        adj[u2, v2] = 0
+        adj[u1, v2] = 1
+        adj[u2, v1] = 1
+        edge_v[e1] = v2
+        edge_v[e2] = v1
+        accepted += 1
+
+    return accepted
+
+
+@njit
 def evaluate_pair_motifs_numba(
     offsets: np.ndarray,
     edge_v: np.ndarray,
@@ -198,7 +238,7 @@ def evaluate_pair_motifs_numba(
     )
 
 
-@njit(cache=True)
+@njit
 def evaluate_single_node_ppi_delta_numba(
     offsets: np.ndarray,
     edge_v: np.ndarray,
@@ -207,11 +247,7 @@ def evaluate_single_node_ppi_delta_numba(
     dup_mat: np.ndarray,
     use_dup: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Calcola per ciascun singolo nodo `u`:
-    - ppi_complex_delta: coppie di bersagli connessi in STRING
-    - ppi_dup_delta: coppie di bersagli sia connessi in STRING sia paraloghi
-    """
+    """Calcola ppi_complex_delta (STRING) e ppi_dup_delta (STRING & paraloghi) per nodo."""
     n_nodes = nodes.shape[0]
     out_complex = np.zeros(n_nodes, dtype=np.int64)
     out_dup = np.zeros(n_nodes, dtype=np.int64)
@@ -238,7 +274,7 @@ def evaluate_single_node_ppi_delta_numba(
     return out_complex, out_dup
 
 
-@njit(cache=True)
+@njit
 def run_null_ensemble_pairs_numba(
     edge_u: np.ndarray,
     edge_v_orig: np.ndarray,
@@ -246,6 +282,7 @@ def run_null_ensemble_pairs_numba(
     n_v: int,
     pair_u: np.ndarray,
     pair_w: np.ndarray,
+    n_wgd: int,
     ppi_mat: np.ndarray,
     dup_mat: np.ndarray,
     use_ppi: bool,
@@ -254,97 +291,148 @@ def run_null_ensemble_pairs_numba(
     burn_in_factor: int,
     step_factor: int,
     seed: int,
-    track_per_pair: bool,
+    track_wgd: bool,
+    track_ssd: bool,
     independent_replicas: bool = False,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Ensemble nullo di Maslov-Sneppen su coppie di nodi con aggregazione Welford per coppia.
+    Ensemble nullo condiviso WGD + SSD in singolo passaggio con Welford online.
+    Indici metriche in null_wgd/null_ssd (6, n_null):
+      0=v_motifs, 1=mean_dice, 2=generic_k22_bifans, 3=dup_target_bifans,
+      4=ppi_complex_bifans, 5=ppi_dup_bifans.
+    Indici in pair_mean/pair_m2 (3, n_total):
+      0=v_motifs, 1=ppi_complex_bifans, 2=ppi_dup_bifans.
     """
     _seed_numba(seed)
     n_edges = edge_u.shape[0]
-    n_pairs = pair_u.shape[0]
+    n_u = offsets.shape[0] - 1
+    n_total = pair_u.shape[0]
+    n_ssd = n_total - n_wgd
 
     edge_v = edge_v_orig.copy()
+    use_dense = (n_u * n_v) <= 20_000_000
+    if use_dense:
+        adj = np.zeros((n_u, n_v), dtype=np.uint8)
+        for k in range(n_edges):
+            adj[edge_u[k], edge_v[k]] = 1
+    else:
+        adj = np.zeros((1, 1), dtype=np.uint8)
 
-    null_v = np.zeros(n_null, dtype=np.float64)
-    null_dice = np.zeros(n_null, dtype=np.float64)
-    null_gk = np.zeros(n_null, dtype=np.float64)
-    null_db = np.zeros(n_null, dtype=np.float64)
-    null_pcb = np.zeros(n_null, dtype=np.float64)
-    null_pdb = np.zeros(n_null, dtype=np.float64)
+    null_wgd = np.zeros((6, n_null), dtype=np.float64)
+    null_ssd = np.zeros((6, n_null), dtype=np.float64)
 
-    p_len = n_pairs if track_per_pair else 1
-    pv_mean = np.zeros(p_len, dtype=np.float64)
-    pv_m2 = np.zeros(p_len, dtype=np.float64)
-    ppcb_mean = np.zeros(p_len, dtype=np.float64)
-    ppcb_m2 = np.zeros(p_len, dtype=np.float64)
-    ppdb_mean = np.zeros(p_len, dtype=np.float64)
-    ppdb_m2 = np.zeros(p_len, dtype=np.float64)
+    p_len = n_total if (track_wgd or track_ssd) else 1
+    pair_mean = np.zeros((3, p_len), dtype=np.float64)
+    pair_m2 = np.zeros((3, p_len), dtype=np.float64)
 
     if not independent_replicas:
-        rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
+        if use_dense:
+            rewire_bipartite_maslov_sneppen_dense(edge_u, edge_v, adj, burn_in_factor * n_edges)
+        else:
+            rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
 
     for r in range(n_null):
         if independent_replicas:
-            edge_v = edge_v_orig.copy()
-            rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
+            if r > 0:
+                if use_dense:
+                    for k in range(n_edges):
+                        adj[edge_u[k], edge_v[k]] = 0
+                edge_v[:] = edge_v_orig
+                if use_dense:
+                    for k in range(n_edges):
+                        adj[edge_u[k], edge_v[k]] = 1
+            if use_dense:
+                rewire_bipartite_maslov_sneppen_dense(edge_u, edge_v, adj, burn_in_factor * n_edges)
+            else:
+                rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
         elif r > 0:
-            rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, step_factor * n_edges)
+            if use_dense:
+                rewire_bipartite_maslov_sneppen_dense(edge_u, edge_v, adj, step_factor * n_edges)
+            else:
+                rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, step_factor * n_edges)
 
         vm, dc, _, gk, db, pcb, pdb = evaluate_pair_motifs_numba(
             offsets, edge_v, n_v, pair_u, pair_w, ppi_mat, dup_mat, use_ppi, use_dup
         )
 
-        null_v[r] = float(vm.sum())
-        null_dice[r] = float(dc.mean()) if n_pairs > 0 else 0.0
-        null_gk[r] = float(gk.sum())
-        null_db[r] = float(db.sum())
-        null_pcb[r] = float(pcb.sum())
-        null_pdb[r] = float(pdb.sum())
+        if n_wgd > 0:
+            sv = sdc = sgk = sdb = spcb = spdb = 0.0
+            for p in range(n_wgd):
+                sv += vm[p]
+                sdc += dc[p]
+                sgk += gk[p]
+                sdb += db[p]
+                spcb += pcb[p]
+                spdb += pdb[p]
+            null_wgd[0, r] = sv
+            null_wgd[1, r] = sdc / n_wgd
+            null_wgd[2, r] = sgk
+            null_wgd[3, r] = sdb
+            null_wgd[4, r] = spcb
+            null_wgd[5, r] = spdb
 
-        if track_per_pair:
-            inv_cnt = 1.0 / (r + 1)
-            for p in range(n_pairs):
+        if n_ssd > 0:
+            sv = sdc = sgk = sdb = spcb = spdb = 0.0
+            for p in range(n_wgd, n_total):
+                sv += vm[p]
+                sdc += dc[p]
+                sgk += gk[p]
+                sdb += db[p]
+                spcb += pcb[p]
+                spdb += pdb[p]
+            null_ssd[0, r] = sv
+            null_ssd[1, r] = sdc / n_ssd
+            null_ssd[2, r] = sgk
+            null_ssd[3, r] = sdb
+            null_ssd[4, r] = spcb
+            null_ssd[5, r] = spdb
+
+        inv_cnt = 1.0 / (r + 1)
+        if track_wgd and n_wgd > 0:
+            for p in range(n_wgd):
                 fv = float(vm[p])
-                dv = fv - pv_mean[p]
-                pv_mean[p] += dv * inv_cnt
-                pv_m2[p] += dv * (fv - pv_mean[p])
+                dv = fv - pair_mean[0, p]
+                pair_mean[0, p] += dv * inv_cnt
+                pair_m2[0, p] += dv * (fv - pair_mean[0, p])
 
                 fc = float(pcb[p])
-                dc_ = fc - ppcb_mean[p]
-                ppcb_mean[p] += dc_ * inv_cnt
-                ppcb_m2[p] += dc_ * (fc - ppcb_mean[p])
+                dc_ = fc - pair_mean[1, p]
+                pair_mean[1, p] += dc_ * inv_cnt
+                pair_m2[1, p] += dc_ * (fc - pair_mean[1, p])
 
                 fd = float(pdb[p])
-                dd = fd - ppdb_mean[p]
-                ppdb_mean[p] += dd * inv_cnt
-                ppdb_m2[p] += dd * (fd - ppdb_mean[p])
+                dd = fd - pair_mean[2, p]
+                pair_mean[2, p] += dd * inv_cnt
+                pair_m2[2, p] += dd * (fd - pair_mean[2, p])
 
-    return (
-        null_v, null_dice, null_gk, null_db, null_pcb, null_pdb,
-        pv_mean, pv_m2, ppcb_mean, ppcb_m2, ppdb_mean, ppdb_m2,
-    )
+        if track_ssd and n_ssd > 0:
+            for p in range(n_wgd, n_total):
+                fv = float(vm[p])
+                dv = fv - pair_mean[0, p]
+                pair_mean[0, p] += dv * inv_cnt
+                pair_m2[0, p] += dv * (fv - pair_mean[0, p])
+
+                fc = float(pcb[p])
+                dc_ = fc - pair_mean[1, p]
+                pair_mean[1, p] += dc_ * inv_cnt
+                pair_m2[1, p] += dc_ * (fc - pair_mean[1, p])
+
+                fd = float(pdb[p])
+                dd = fd - pair_mean[2, p]
+                pair_mean[2, p] += dd * inv_cnt
+                pair_m2[2, p] += dd * (fd - pair_mean[2, p])
+
+    return null_wgd, null_ssd, pair_mean, pair_m2
 
 
-@njit(cache=True)
-def run_null_ensemble_ppi_delta_numba(
+@njit
+def run_null_ensemble_ppi_delta_multi_numba(
     edge_u: np.ndarray,
     edge_v_orig: np.ndarray,
     offsets: np.ndarray,
-    nodes: np.ndarray,
+    n_v: int,
+    all_nodes: np.ndarray,
+    cohort_offsets: np.ndarray,
     ppi_mat: np.ndarray,
     dup_mat: np.ndarray,
     use_dup: bool,
@@ -354,28 +442,62 @@ def run_null_ensemble_ppi_delta_numba(
     seed: int,
     independent_replicas: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Ensemble nullo di Maslov-Sneppen per PPI-Complex Delta e PPI-Dup Delta (Via 3)."""
+    """Ensemble nullo condiviso per PPI-Complex Delta e PPI-Dup Delta su tutte le coorti Via 3."""
     _seed_numba(seed)
     n_edges = edge_u.shape[0]
+    n_u = offsets.shape[0] - 1
+    n_cohorts = cohort_offsets.shape[0] - 1
+
     edge_v = edge_v_orig.copy()
-    null_complex = np.zeros(n_null, dtype=np.float64)
-    null_dup = np.zeros(n_null, dtype=np.float64)
+    use_dense = (n_u * n_v) <= 20_000_000
+    if use_dense:
+        adj = np.zeros((n_u, n_v), dtype=np.uint8)
+        for k in range(n_edges):
+            adj[edge_u[k], edge_v[k]] = 1
+    else:
+        adj = np.zeros((1, 1), dtype=np.uint8)
+
+    null_complex = np.zeros((n_cohorts, n_null), dtype=np.float64)
+    null_dup = np.zeros((n_cohorts, n_null), dtype=np.float64)
 
     if not independent_replicas:
-        rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
+        if use_dense:
+            rewire_bipartite_maslov_sneppen_dense(edge_u, edge_v, adj, burn_in_factor * n_edges)
+        else:
+            rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
 
     for r in range(n_null):
         if independent_replicas:
-            edge_v = edge_v_orig.copy()
-            rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
+            if r > 0:
+                if use_dense:
+                    for k in range(n_edges):
+                        adj[edge_u[k], edge_v[k]] = 0
+                edge_v[:] = edge_v_orig
+                if use_dense:
+                    for k in range(n_edges):
+                        adj[edge_u[k], edge_v[k]] = 1
+            if use_dense:
+                rewire_bipartite_maslov_sneppen_dense(edge_u, edge_v, adj, burn_in_factor * n_edges)
+            else:
+                rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, burn_in_factor * n_edges)
         elif r > 0:
-            rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, step_factor * n_edges)
+            if use_dense:
+                rewire_bipartite_maslov_sneppen_dense(edge_u, edge_v, adj, step_factor * n_edges)
+            else:
+                rewire_bipartite_maslov_sneppen(edge_u, edge_v, offsets, step_factor * n_edges)
 
         cnt_c, cnt_d = evaluate_single_node_ppi_delta_numba(
-            offsets, edge_v, nodes, ppi_mat, dup_mat, use_dup
+            offsets, edge_v, all_nodes, ppi_mat, dup_mat, use_dup
         )
-        null_complex[r] = float(cnt_c.sum())
-        null_dup[r] = float(cnt_d.sum())
+        for c in range(n_cohorts):
+            s = cohort_offsets[c]
+            e = cohort_offsets[c + 1]
+            sc = sd = 0.0
+            for idx in range(s, e):
+                sc += cnt_c[idx]
+                sd += cnt_d[idx]
+            null_complex[c, r] = sc
+            null_dup[c, r] = sd
 
     return null_complex, null_dup
 
