@@ -7,6 +7,7 @@ import polars as pl
 from scipy.stats import fisher_exact, ks_2samp, mannwhitneyu
 
 from .config import PATHS, ProjectPaths
+from .stats import bootstrap_mean_ci
 
 logger = logging.getLogger("OhnomiTools.expression")
 
@@ -24,7 +25,7 @@ EXPRESSION_CONTEXT_COLS: list[str] = [
 
 
 def _ordinal_expr(col_name: str) -> pl.Expr:
-    """Codifica ordinale standard LncBook v2.0: HC=3, MC=2, LC=1, NE/altro=0."""
+    """Codifica ordinale LncBook v2.0: HC=3, MC=2, LC=1, NE/altro=0."""
     cleaned = pl.col(col_name).cast(pl.Utf8).str.strip_chars().str.to_uppercase()
     return (
         pl.when(cleaned == "HC").then(3)
@@ -36,38 +37,39 @@ def _ordinal_expr(col_name: str) -> pl.Expr:
 
 
 class MultiOmicsExpressionAnalyzer:
-    """
-    Fase 4: Analisi della dinamica di espressione multi-contesto (LncBook v2.0),
-    divergenza di espressione nelle coppie duplicate (Cosine Distance 1 - cos e
-    Manhattan normalizzata), profili epigenetici di metilazione in patologia e
-    potenziale codificante nascosto (Small Proteins / SmProt) sulle 3 Vie analitiche.
-    """
+    """Fase 4: espressione multi-contesto, divergenza a coppie, metilazione e SmProt."""
 
     def __init__(self, paths: ProjectPaths = PATHS) -> None:
         self.paths = paths
 
+    def _get_sprotein_exclude_ids(
+        self,
+        df_mo: pl.DataFrame,
+        exclude_sprotein: str | None,
+    ) -> set[str]:
+        if exclude_sprotein is None:
+            return set()
+        if exclude_sprotein not in {"all", "ms_only"}:
+            raise ValueError("`exclude_sprotein` deve essere None, 'all' oppure 'ms_only'.")
+        col = "has_sprotein" if exclude_sprotein == "all" else "has_sprotein_ms"
+        if col not in df_mo.columns:
+            raise ValueError(f"Colonna '{col}' non presente nella tabella multi-omica.")
+        return set(df_mo.filter(pl.col(col) == True)["lncrna_gene_id"].to_list())
+
     def build_gene_multiomics_table(self, force_rebuild: bool = False) -> pl.DataFrame:
-        """
-        Unifica a livello di singolo gene lncRNA (`lncrna_gene_id`) le informazioni di:
-        - Espressione meta-categoriale (9 contesti codificati 0..3, breadth, score medio,
-          Featured Expression, Expression Capacity globale)
-        - Metilazione differenziale in 16 patologie (promoter/body, hyper/hypo)
-        - Small Proteins (SmProt: numero micropeptidi, evidenza Mass Spec / Ribo-seq)
-        """
+        """Unifica a livello di gene lncRNA espressione (9 contesti), metilazione e SmProt."""
         out_pq = self.paths.silver / "lncbook_gene_multiomics_features.parquet"
         if out_pq.exists() and not force_rebuild:
             return pl.read_parquet(out_pq)
 
-        # Base: tutti i geni lncRNA canonici del GTF LncBook v2.0
         df_base = pl.read_parquet(self.paths.silver_lncrna_genes).select([
             pl.col("gene_id").alias("lncrna_gene_id"),
             pl.col("chr"),
             pl.col("strand"),
-            (pl.col("end") - pl.col("start")).alias("lnc_length_bp"),
+            (pl.col("end") - pl.col("start") + 1).alias("lnc_length_bp"),
             pl.col("n_isoforms"),
         ]).unique(subset=["lncrna_gene_id"])
 
-        # 1. Espressione LncBook v2.0
         df_expr_raw = pl.read_parquet(self.paths.silver_lncbook_expr).unique(subset=["Gene ID"])
         avail_ctx = [c for c in EXPRESSION_CONTEXT_COLS if c in df_expr_raw.columns]
 
@@ -94,7 +96,6 @@ class MultiOmicsExpressionAnalyzer:
             )
         )
 
-        # Rinomina leggibile anche per i singoli contesti
         ctx_rename = {f"ctx_{i}": f"expr__{c}" for i, c in enumerate(avail_ctx)}
         df_expr = df_expr.rename(ctx_rename)
 
@@ -102,7 +103,6 @@ class MultiOmicsExpressionAnalyzer:
             pl.col("in_expr_db").fill_null(False)
         )
 
-        # 2. Metilazione LncBook v2.0 (aggregata per Gene ID su tutte le regioni/patologie)
         if self.paths.silver_lncbook_methylation.exists():
             df_m_raw = pl.read_parquet(self.paths.silver_lncbook_methylation)
             meta_cols = {"Gene ID", "Symbol", "Methylation Region"}
@@ -145,7 +145,6 @@ class MultiOmicsExpressionAnalyzer:
                 pl.col("n_meth_total_events").fill_null(0),
             ])
 
-        # 3. Small Proteins (SmProt)
         if self.paths.silver_lncbook_sprotein.exists():
             df_sp_raw = pl.read_parquet(self.paths.silver_lncbook_sprotein)
             df_sp = (
@@ -176,7 +175,7 @@ class MultiOmicsExpressionAnalyzer:
         return df_merged
 
     def _get_three_lane_cohorts(self) -> list[tuple[str, str, set[str]]]:
-        """Restituisce esattamente le stesse coorti delle 3 Vie usate nella Fase 3."""
+        """Coorti delle 3 Vie con disgiunzione stretta WGD vs SSD (Agasso et al., 2025)."""
         def _pair_ids(pq: Path, ancient_ssd: bool = False) -> set[str]:
             df = pl.read_parquet(pq)
             if ancient_ssd and "is_ancient_ssd" in df.columns:
@@ -184,9 +183,17 @@ class MultiOmicsExpressionAnalyzer:
             return set(df["lncrna_1"].to_list()) | set(df["lncrna_2"].to_list())
 
         wgd1 = _pair_ids(self.paths.silver_lane1_wgd_pairs)
-        ssd1 = _pair_ids(self.paths.silver_lane1_ssd_pairs, ancient_ssd=True)
+        ssd1_raw = _pair_ids(self.paths.silver_lane1_ssd_pairs, ancient_ssd=True)
+        ssd1 = ssd1_raw - wgd1
+
         wgd2 = _pair_ids(self.paths.silver_lane2_wgd_pairs)
-        ssd2 = _pair_ids(self.paths.silver_lane2_ssd_pairs)
+        ssd2_raw = _pair_ids(self.paths.silver_lane2_ssd_pairs)
+        ssd2 = ssd2_raw - wgd2
+
+        logger.info(
+            f"[Fase 4] Disgiunzione WGD/SSD: rimossi {len(ssd1_raw) - len(ssd1):,} "
+            f"geni sovrapposti da SSD Via 1 e {len(ssd2_raw) - len(ssd2):,} da SSD Via 2."
+        )
 
         df_via3 = pl.read_parquet(self.paths.silver_lane3_euteleostomi)
         df_phylo = pl.read_parquet(self.paths.silver_phylostratigraphy)
@@ -214,26 +221,30 @@ class MultiOmicsExpressionAnalyzer:
     def analyze_expression_and_multiomics_cohorts(
         self,
         df_mo: pl.DataFrame | None = None,
+        exclude_sprotein: str | None = None,
+        save_outputs: bool = True,
+        output_tag: str | None = None,
     ) -> dict[str, pl.DataFrame]:
-        """
-        Analizza a livello di singolo gene su tutte e 3 le Vie:
-        1. Capacità di espressione, ampiezza (`n_ctx_expressed`, `n_ctx_hc_mc`),
-           `Featured Expression`, `has_diff_methylation`, `has_sprotein`.
-        2. Test statistici (Mann-Whitney U, KS, Fisher exact) sui confronti chiave.
-        3. Profilo dettagliato di espressione alta (`HC` / `HC+MC`) nei 9 contesti biologici.
-        """
+        """Confronti multi-omici a singolo gene sulle 3 Vie (con filtro SmProt opzionale)."""
         if df_mo is None:
             df_mo = self.build_gene_multiomics_table(force_rebuild=False)
+
+        is_canonical = exclude_sprotein is None and output_tag is None
+        sp_exclude = self._get_sprotein_exclude_ids(df_mo, exclude_sprotein)
+        df_work = (
+            df_mo.filter(~pl.col("lncrna_gene_id").is_in(list(sp_exclude)))
+            if sp_exclude else df_mo
+        )
 
         cohorts = self._get_three_lane_cohorts()
         summary_rows = []
         context_rows = []
         cohort_dfs: dict[str, pl.DataFrame] = {}
 
-        avail_ctx = [c for c in EXPRESSION_CONTEXT_COLS if f"expr__{c}" in df_mo.columns]
+        avail_ctx = [c for c in EXPRESSION_CONTEXT_COLS if f"expr__{c}" in df_work.columns]
 
         for lane_lbl, grp_lbl, id_set in cohorts:
-            sub = df_mo.filter(pl.col("lncrna_gene_id").is_in(list(id_set)))
+            sub = df_work.filter(pl.col("lncrna_gene_id").is_in(list(id_set)))
             sub_expr = sub.filter(pl.col("in_expr_db"))
             cohort_dfs[grp_lbl] = sub
 
@@ -263,7 +274,6 @@ class MultiOmicsExpressionAnalyzer:
                 )
             context_rows.append(ctx_row)
 
-        # Test statistici sui confronti chiave
         comparisons = [
             ("Via 1: WGD vs SSD_ancient", "WGD_intragenic", "SSD_ancient_intragenic"),
             ("Via 2 (A∩B): WGD vs SSD_ancient", "WGD_AB_ancient", "SSD_AB_ancient"),
@@ -280,30 +290,26 @@ class MultiOmicsExpressionAnalyzer:
             e1 = d1.filter(pl.col("in_expr_db"))
             e2 = d2.filter(pl.col("in_expr_db"))
 
-            # Mann-Whitney su score medio di espressione (0..3)
             s1 = e1["expr_mean_score"].to_numpy()
             s2 = e2["expr_mean_score"].to_numpy()
             _, mw_expr_p = mannwhitneyu(s1, s2, alternative="two-sided") if (len(s1) >= 5 and len(s2) >= 5) else (np.nan, np.nan)
 
-            # Fisher su Featured Expression
             fe1 = int(e1["is_featured_expr"].sum())
             fe2 = int(e2["is_featured_expr"].sum())
             or_fe, p_fe = fisher_exact([[fe1, len(e1) - fe1], [fe2, len(e2) - fe2]])
 
-            # Fisher su Metilazione Differenziale
             m1 = int(d1["has_diff_methylation"].sum()) if "has_diff_methylation" in d1.columns else 0
             m2 = int(d2["has_diff_methylation"].sum()) if "has_diff_methylation" in d2.columns else 0
             or_m, p_m = fisher_exact([[m1, len(d1) - m1], [m2, len(d2) - m2]])
 
-            # Fisher su Small Proteins (SmProt)
             sp1 = int(d1["has_sprotein"].sum()) if "has_sprotein" in d1.columns else 0
             sp2 = int(d2["has_sprotein"].sum()) if "has_sprotein" in d2.columns else 0
             or_sp, p_sp = fisher_exact([[sp1, len(d1) - sp1], [sp2, len(d2) - sp2]])
 
             test_rows.append({
                 "Confronto": label,
-                "ExprScore_1": round(float(np.mean(s1)), 3),
-                "ExprScore_2": round(float(np.mean(s2)), 3),
+                "ExprScore_1": round(float(np.mean(s1)), 3) if len(s1) else np.nan,
+                "ExprScore_2": round(float(np.mean(s2)), 3) if len(s2) else np.nan,
                 "Expr_MW_p": float(mw_expr_p),
                 "Featured_OR": round(float(or_fe), 3),
                 "Featured_p": float(p_fe),
@@ -317,27 +323,49 @@ class MultiOmicsExpressionAnalyzer:
         df_contexts = pl.DataFrame(context_rows)
         df_tests = pl.DataFrame(test_rows)
 
-        df_summary.write_csv(self.paths.gold / "phase4_multiomics_cohorts_summary.csv")
-        df_contexts.write_csv(self.paths.gold / "phase4_expression_contexts_profile.csv")
-        df_tests.write_csv(self.paths.gold / "phase4_multiomics_cohorts_tests.csv")
+        if save_outputs and (is_canonical or output_tag is not None):
+            suffix = f"_{output_tag}" if output_tag else ""
+            df_summary.write_csv(self.paths.gold / f"phase4_multiomics_cohorts_summary{suffix}.csv")
+            df_contexts.write_csv(self.paths.gold / f"phase4_expression_contexts_profile{suffix}.csv")
+            df_tests.write_csv(self.paths.gold / f"phase4_multiomics_cohorts_tests{suffix}.csv")
 
         return {"summary": df_summary, "contexts": df_contexts, "tests": df_tests}
 
     def analyze_pairwise_expression_divergence(
         self,
         df_mo: pl.DataFrame | None = None,
+        rel_strand_filter: str | None = None,
+        strict_1to1_only: bool = False,
+        aggregate_by_host: str | None = None,
+        exclude_sprotein: str | None = None,
+        save_outputs: bool = True,
+        output_tag: str | None = None,
     ) -> dict[str, pl.DataFrame | dict]:
         """
-        Calcola la divergenza di espressione tra i due membri di ciascuna coppia
-        duplicata (Via 1 Ramo A e Via 2 A ∩ B, confrontando WGD vs SSD antiche):
-        - Distanza Coseno: d_cos = 1 - (e1 · e2) / (||e1|| ||e2||) (stile Agasso et al. Fig. 5D)
-        - Distanza di Manhattan normalizzata: d_L1 = sum(|e1 - e2|) / (3 * 9) in [0, 1]
-        - Asimmetria di espressione: |sum(e1) - sum(e2)| / (sum(e1) + sum(e2))
-        - Concordanza esatta dei contesti: frazione di contesti con uguale livello (0..3)
+        Divergenza di espressione nelle coppie duplicate (d_cos, d_L1, asimmetria, exact match).
+        Supporta controlli P0:
+        - `rel_strand_filter`: None | 'sense' | 'antisense'
+        - `strict_1to1_only`: True per il subset 1:1 puro
+        - `aggregate_by_host`: None | 'median' | 'mean' (1 osservazione per `pair_key` host)
+        - `exclude_sprotein`: None | 'all' | 'ms_only'
         """
+        if rel_strand_filter not in {None, "sense", "antisense"}:
+            raise ValueError("`rel_strand_filter` deve essere None, 'sense' oppure 'antisense'.")
+        if aggregate_by_host not in {None, "median", "mean"}:
+            raise ValueError("`aggregate_by_host` deve essere None, 'median' oppure 'mean'.")
+
         if df_mo is None:
             df_mo = self.build_gene_multiomics_table(force_rebuild=False)
 
+        is_canonical = (
+            rel_strand_filter is None
+            and not strict_1to1_only
+            and aggregate_by_host is None
+            and exclude_sprotein is None
+            and output_tag is None
+        )
+
+        sp_exclude = self._get_sprotein_exclude_ids(df_mo, exclude_sprotein)
         avail_ctx = [f"expr__{c}" for c in EXPRESSION_CONTEXT_COLS if f"expr__{c}" in df_mo.columns]
         n_ctx = len(avail_ctx)
 
@@ -363,6 +391,16 @@ class MultiOmicsExpressionAnalyzer:
                     pq = self.paths.silver_lane2_wgd_pairs if dup_type == "WGD" else self.paths.silver_lane2_ssd_pairs
                     df_p = pl.read_parquet(pq)
 
+                if rel_strand_filter is not None and "rel_strand_1" in df_p.columns:
+                    df_p = df_p.filter(pl.col("rel_strand_1") == rel_strand_filter)
+                if strict_1to1_only and "is_strict_1to1_host" in df_p.columns:
+                    df_p = df_p.filter(pl.col("is_strict_1to1_host") == True)
+                if sp_exclude:
+                    sp_list = list(sp_exclude)
+                    df_p = df_p.filter(
+                        ~pl.col("lncrna_1").is_in(sp_list) & ~pl.col("lncrna_2").is_in(sp_list)
+                    )
+
                 df_p = df_p.unique(subset=["lncrna_pair_key"])
 
                 i1_list = []
@@ -379,13 +417,16 @@ class MultiOmicsExpressionAnalyzer:
                         mask.append(False)
 
                 df_in = df_p.filter(pl.Series(mask))
+                if len(df_in) == 0:
+                    lane_tables[dup_type] = pl.DataFrame()
+                    pair_outputs[f"{lane}_{dup_type}"] = pl.DataFrame()
+                    continue
+
                 v1 = E_mat[np.array(i1_list, dtype=np.int32)]
                 v2 = E_mat[np.array(i2_list, dtype=np.int32)]
 
-                # Manhattan normalizzata in [0, 1]
                 manhattan_norm = np.sum(np.abs(v1 - v2), axis=1) / (3.0 * n_ctx)
 
-                # Cosine Distance (solo se entrambi i vettori sono non nulli)
                 n1 = np.linalg.norm(v1, axis=1)
                 n2 = np.linalg.norm(v2, axis=1)
                 denom = n1 * n2
@@ -394,13 +435,11 @@ class MultiOmicsExpressionAnalyzer:
                 cos_sim[both_active] = np.sum(v1[both_active] * v2[both_active], axis=1) / denom[both_active]
                 cos_dist = 1.0 - np.clip(cos_sim, 0.0, 1.0)
 
-                # Asimmetria di ampiezza
                 s1 = np.sum(v1, axis=1)
                 s2 = np.sum(v2, axis=1)
                 asym = np.zeros(len(df_in), dtype=np.float64)
                 np.divide(np.abs(s1 - s2), s1 + s2, out=asym, where=(s1 + s2) > 0)
 
-                # Frazione di contesti identici
                 exact_match = np.mean(v1 == v2, axis=1)
 
                 keep_cols = [
@@ -419,71 +458,126 @@ class MultiOmicsExpressionAnalyzer:
                     pl.Series("expr_asymmetry", np.round(asym, 5)),
                     pl.Series("exact_ctx_match", np.round(exact_match, 4)),
                 ])
-                lane_tables[dup_type] = df_res
-                pair_outputs[f"{lane}_{dup_type}"] = df_res
 
-                valid_cd = cos_dist[both_active]
+                if aggregate_by_host is not None:
+                    metric_cols = ["cosine_distance", "manhattan_norm", "expr_asymmetry", "exact_ctx_match"]
+                    agg_exprs = [
+                        pl.len().alias("n_lncrna_pairs_in_host"),
+                        pl.col("both_expressed").any().alias("both_expressed"),
+                    ]
+                    for mc in metric_cols:
+                        col_clean = pl.col(mc).drop_nans()
+                        agg_exprs.append(
+                            (col_clean.median() if aggregate_by_host == "median" else col_clean.mean()).alias(mc)
+                        )
+                    df_eval = df_res.group_by("pair_key").agg(agg_exprs)
+                else:
+                    df_eval = df_res
+
+                lane_tables[dup_type] = df_eval
+                pair_outputs[f"{lane}_{dup_type}"] = df_eval
+
+                valid_cd = df_eval["cosine_distance"].drop_nulls().drop_nans().to_numpy()
+                valid_mn = df_eval["manhattan_norm"].drop_nulls().drop_nans().to_numpy()
+                valid_as = df_eval["expr_asymmetry"].drop_nulls().drop_nans().to_numpy()
+                valid_em = df_eval["exact_ctx_match"].drop_nulls().drop_nans().to_numpy()
+                both_pct = 100.0 * float(df_eval["both_expressed"].mean()) if len(df_eval) else 0.0
+
                 summary_rows.append({
                     "Via": lane,
                     "Tipo": dup_type,
-                    "N_coppie_in_Expr": len(df_res),
-                    "Both_Expressed_pct": round(100.0 * float(np.mean(both_active)), 2),
+                    "Unita_statistica": f"host_{aggregate_by_host}" if aggregate_by_host else "lncrna_pair",
+                    "N_osservazioni": len(df_eval),
+                    "Both_Expressed_pct": round(both_pct, 2),
                     "CosDist_media": round(float(np.mean(valid_cd)), 4) if len(valid_cd) else np.nan,
                     "CosDist_mediana": round(float(np.median(valid_cd)), 4) if len(valid_cd) else np.nan,
-                    "Manhattan_media": round(float(np.mean(manhattan_norm)), 4),
-                    "Manhattan_mediana": round(float(np.median(manhattan_norm)), 4),
-                    "Asimmetria_media": round(float(np.mean(asym)), 4),
-                    "ExactMatch_media": round(float(np.mean(exact_match)), 4),
+                    "Manhattan_media": round(float(np.mean(valid_mn)), 4) if len(valid_mn) else np.nan,
+                    "Manhattan_mediana": round(float(np.median(valid_mn)), 4) if len(valid_mn) else np.nan,
+                    "Asimmetria_media": round(float(np.mean(valid_as)), 4) if len(valid_as) else np.nan,
+                    "ExactMatch_media": round(float(np.mean(valid_em)), 4) if len(valid_em) else np.nan,
                 })
 
-                if dup_type == "WGD":
+                if dup_type == "WGD" and save_outputs and is_canonical:
                     self.paths.save_parquet_safe(
                         df_res, self.paths.silver / f"phase4_{lane}_wgd_expression_pairs.parquet"
                     )
 
-            # Test KS e Mann-Whitney WGD vs SSD antiche per questa Via
-            tw, ts = lane_tables["WGD"], lane_tables["SSD"]
-            for metric in ("cosine_distance", "manhattan_norm", "expr_asymmetry", "exact_ctx_match"):
-                aw = tw[metric].drop_nulls().drop_nans().to_numpy()
-                as_ = ts[metric].drop_nulls().drop_nans().to_numpy()
-                ks_s, ks_p = ks_2samp(aw, as_)
-                _, mw_p = mannwhitneyu(aw, as_, alternative="two-sided")
-                test_rows.append({
-                    "Via": lane,
-                    "Metrica": metric,
-                    "WGD_n": len(aw),
-                    "WGD_media": round(float(np.mean(aw)), 4),
-                    "WGD_mediana": round(float(np.median(aw)), 4),
-                    "SSD_n": len(as_),
-                    "SSD_media": round(float(np.mean(as_)), 4),
-                    "SSD_mediana": round(float(np.median(as_)), 4),
-                    "KS_stat": round(float(ks_s), 4),
-                    "KS_p": float(ks_p),
-                    "MW_p": float(mw_p),
-                })
+            tw, ts = lane_tables.get("WGD", pl.DataFrame()), lane_tables.get("SSD", pl.DataFrame())
+            if len(tw) > 0 and len(ts) > 0:
+                for metric in ("cosine_distance", "manhattan_norm", "expr_asymmetry", "exact_ctx_match"):
+                    aw = tw[metric].drop_nulls().drop_nans().to_numpy()
+                    as_ = ts[metric].drop_nulls().drop_nans().to_numpy()
+                    if len(aw) < 3 or len(as_) < 3:
+                        ks_s = ks_p = mw_p = float("nan")
+                    else:
+                        ks_s, ks_p = ks_2samp(aw, as_)
+                        _, mw_p = mannwhitneyu(aw, as_, alternative="two-sided")
+                    test_rows.append({
+                        "Via": lane,
+                        "Metrica": metric,
+                        "WGD_n": len(aw),
+                        "WGD_media": round(float(np.mean(aw)), 4) if len(aw) else np.nan,
+                        "WGD_mediana": round(float(np.median(aw)), 4) if len(aw) else np.nan,
+                        "SSD_n": len(as_),
+                        "SSD_media": round(float(np.mean(as_)), 4) if len(as_) else np.nan,
+                        "SSD_mediana": round(float(np.median(as_)), 4) if len(as_) else np.nan,
+                        "KS_stat": round(float(ks_s), 4) if np.isfinite(ks_s) else np.nan,
+                        "KS_p": float(ks_p),
+                        "MW_p": float(mw_p),
+                    })
 
         df_sum = pl.DataFrame(summary_rows)
         df_tests = pl.DataFrame(test_rows)
-        df_sum.write_csv(self.paths.gold / "phase4_pairwise_expression_summary.csv")
-        df_tests.write_csv(self.paths.gold / "phase4_pairwise_expression_tests.csv")
+        if save_outputs and (is_canonical or output_tag is not None):
+            suffix = f"_{output_tag}" if output_tag else ""
+            df_sum.write_csv(self.paths.gold / f"phase4_pairwise_expression_summary{suffix}.csv")
+            df_tests.write_csv(self.paths.gold / f"phase4_pairwise_expression_tests{suffix}.csv")
 
         return {"summary": df_sum, "tests": df_tests, "pair_tables": pair_outputs}
+
+    def analyze_sense_vs_antisense_divergence(
+        self,
+        df_mo: pl.DataFrame | None = None,
+        aggregate_by_host: str | None = None,
+        exclude_sprotein: str | None = None,
+        save_outputs: bool = False,
+        output_tag: str = "sense_vs_antisense",
+    ) -> dict[str, pl.DataFrame]:
+        """Controllo 1 (read-through): confronta WGD vs SSD separatamente su sense e antisense."""
+        if df_mo is None:
+            df_mo = self.build_gene_multiomics_table(force_rebuild=False)
+
+        sum_chunks: list[pl.DataFrame] = []
+        test_chunks: list[pl.DataFrame] = []
+        for strand_mode in ("sense", "antisense"):
+            res = self.analyze_pairwise_expression_divergence(
+                df_mo=df_mo,
+                rel_strand_filter=strand_mode,
+                aggregate_by_host=aggregate_by_host,
+                exclude_sprotein=exclude_sprotein,
+                save_outputs=False,
+            )
+            if not res["summary"].is_empty():
+                sum_chunks.append(res["summary"].with_columns(pl.lit(strand_mode).alias("Orientamento")))
+            if not res["tests"].is_empty():
+                test_chunks.append(res["tests"].with_columns(pl.lit(strand_mode).alias("Orientamento")))
+
+        df_sum = pl.concat(sum_chunks, how="vertical") if sum_chunks else pl.DataFrame()
+        df_tests = pl.concat(test_chunks, how="vertical") if test_chunks else pl.DataFrame()
+        if save_outputs and not df_tests.is_empty():
+            df_sum.write_csv(self.paths.gold / f"phase4_{output_tag}_summary.csv")
+            df_tests.write_csv(self.paths.gold / f"phase4_{output_tag}_tests.csv")
+        return {"summary": df_sum, "tests": df_tests}
 
     def plot_phase4_summary(
         self,
         cohort_res: dict,
         pair_res: dict,
+        n_boot: int = 10_000,
+        boot_seed: int = 42,
         save_fig: bool = True,
     ) -> tuple[Path | None, Path | None]:
-        """
-        Genera la figura riassuntiva a 3 pannelli della Fase 4 (salvata in `gold/` .png/.pdf):
-        - A) Heatmap/profilo % espressione alta/media (`HC+MC`) nei 9 contesti biologici
-             attraverso le coorti chiave delle 3 Vie.
-        - B) Distanza di espressione a coppie (Cosine Distance 1-cos e Manhattan normalizzata)
-             confrontando WGD vs SSD antiche nella Via 1 e nella Via 2.
-        - C) Firma Multi-Omica sulle 3 Vie: % Featured Expression, % Metilazione Differenziale
-             in patologia e % Micropeptidi (SmProt).
-        """
+        """Figura riassuntiva Fase 4 a 3 pannelli con CI bootstrap non parametrici (B=10,000)."""
         import matplotlib.pyplot as plt
 
         df_ctx: pl.DataFrame = cohort_res["contexts"]
@@ -524,36 +618,50 @@ class MultiOmicsExpressionAnalyzer:
         ax.grid(True, linestyle=":", alpha=0.5)
         ax.legend(fontsize=8, loc="best")
 
-        # --- Pannello B: Divergenza di Espressione a Coppie (WGD vs SSD antiche) ---
+        # --- Pannello B: Divergenza di Espressione a Coppie (CI bootstrap 95%) ---
         ax = axes[1]
         groups_b = [
-            ("via1_WGD", "Via 1\nWGD", "#D62728"),
-            ("via1_SSD", "Via 1\nSSD ant.", "#1F77B4"),
-            ("via2_WGD", "Via 2\nWGD", "#B2182B"),
-            ("via2_SSD", "Via 2\nSSD ant.", "#4393C3"),
+            ("via1_WGD", "Via 1\nWGD"),
+            ("via1_SSD", "Via 1\nSSD ant."),
+            ("via2_WGD", "Via 2\nWGD"),
+            ("via2_SSD", "Via 2\nSSD ant."),
         ]
         x_b = np.arange(len(groups_b))
-        cos_m, cos_e, man_m, man_e = [], [], [], []
-        for key, _, _ in groups_b:
+        cos_m, cos_lo, cos_hi = [], [], []
+        man_m, man_lo, man_hi = [], [], []
+        for idx_g, (key, _) in enumerate(groups_b):
             t = pair_res["pair_tables"][key]
             cd = t["cosine_distance"].drop_nulls().drop_nans().to_numpy()
             mn = t["manhattan_norm"].drop_nulls().drop_nans().to_numpy()
-            cos_m.append(float(np.mean(cd)))
-            cos_e.append(float(1.96 * np.std(cd) / np.sqrt(max(1, len(cd)))))
-            man_m.append(float(np.mean(mn)))
-            man_e.append(float(1.96 * np.std(mn) / np.sqrt(max(1, len(mn)))))
+            cm, clo, chi = bootstrap_mean_ci(cd, n_boot=n_boot, seed=boot_seed + idx_g * 2)
+            mm, mlo, mhi = bootstrap_mean_ci(mn, n_boot=n_boot, seed=boot_seed + idx_g * 2 + 1)
+            cos_m.append(cm)
+            cos_lo.append(max(0.0, cm - clo))
+            cos_hi.append(max(0.0, chi - cm))
+            man_m.append(mm)
+            man_lo.append(max(0.0, mm - mlo))
+            man_hi.append(max(0.0, mhi - mm))
 
         w = 0.35
-        ax.bar(x_b - w / 2, cos_m, width=w, yerr=cos_e, capsize=4, color="#FF7F0E", alpha=0.88, edgecolor="black", linewidth=0.7, label="Cosine Distance (1 − cos)")
-        ax.bar(x_b + w / 2, man_m, width=w, yerr=man_e, capsize=4, color="#6A3D9A", alpha=0.85, edgecolor="black", linewidth=0.7, label="Manhattan Norm. (L1)")
+        ax.bar(
+            x_b - w / 2, cos_m, width=w, yerr=np.vstack([cos_lo, cos_hi]),
+            capsize=4, color="#FF7F0E", alpha=0.88, edgecolor="black", linewidth=0.7,
+            label="Cosine Distance (1 − cos)"
+        )
+        ax.bar(
+            x_b + w / 2, man_m, width=w, yerr=np.vstack([man_lo, man_hi]),
+            capsize=4, color="#6A3D9A", alpha=0.85, edgecolor="black", linewidth=0.7,
+            label="Manhattan Norm. (L1)"
+        )
         ax.set_xticks(x_b)
         ax.set_xticklabels([g[1] for g in groups_b], fontsize=8.8)
-        ax.set_ylabel("Distanza di Espressione Media (± CI 95%)", fontsize=9.5)
+        ax.set_ylim(bottom=0.0)
+        ax.set_ylabel("Distanza di Espressione Media (CI 95% bootstrap)", fontsize=9.5)
         ax.set_title("B) Divergenza vs Co-espressione nelle Coppie\n(WGD vs SSD Antiche — Via 1 e Via 2)", fontsize=10.2, fontweight="bold")
         ax.grid(True, axis="y", linestyle=":", alpha=0.5)
         ax.legend(fontsize=8.3, loc="best")
 
-        # --- Pannello C: Firma Multi-Omica (Featured Expr, Metilazione, SmProt) ---
+        # --- Pannello C: Firma Multi-Omica ---
         ax = axes[2]
         c_order = [
             ("WGD_intragenic", "Via 1 WGD"),
